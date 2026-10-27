@@ -7,7 +7,7 @@
     "dev": "concurrently -k -n API,WEB -c yellow,green \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
-    "test": "tsx --test server/engine.test.ts"
+    "test": "tsx --test server/engine.test.ts server/http.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -108,7 +108,12 @@ export default function App() {
 
   const saveThreshold = async (threshold: number) => {
     await api.updateSettings(selectedSymbol, { buyThreshold: threshold });
-    await loadData();
+    const [dashboard, stockDetail] = await Promise.all([
+      api.dashboard(),
+      api.stock(selectedSymbol),
+    ]);
+    setData(dashboard);
+    setDetail(stockDetail);
     setToast(`研究门槛已保存为 ${threshold.toFixed(1)}%`);
   };
 

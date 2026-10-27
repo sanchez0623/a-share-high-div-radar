@@ -25,10 +25,12 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onOpenPl
   const [scenario, setScenario] = useState<Scenario>('base');
   const [threshold, setThreshold] = useState(stock.buyThreshold);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   useEffect(() => {
     setThreshold(stock.buyThreshold);
     setScenario('base');
+    setSaveError('');
   }, [stock.symbol, stock.buyThreshold]);
 
   const activeScenario = scenarios.find((item) => item.key === scenario)!;
@@ -39,8 +41,11 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onOpenPl
 
   const save = async () => {
     setSaving(true);
+    setSaveError('');
     try {
       await onSave(threshold);
+    } catch (reason) {
+      setSaveError((reason as Error).message || '保存失败，请稍后重试');
     } finally {
       setSaving(false);
     }
@@ -66,11 +71,12 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onOpenPl
           </div>
           <div className="control-group">
             <div className="control-label"><label htmlFor="yield-range">要求股息率</label><output>{percent(threshold, 1)}</output></div>
-            <input id="yield-range" type="range" min="3" max="10" step="0.1" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} />
+            <input id="yield-range" type="range" min="3" max="10" step="0.1" value={threshold} onChange={(event) => { setThreshold(Number(event.target.value)); setSaveError(''); }} />
             <div className="range-labels"><span>3.0% · 宽松</span><span>10.0% · 严格</span></div>
           </div>
           <div className="assumption-note">预测每股分红 <strong>¥{number(estimatedDividend)}</strong><span>{activeScenario.label}情景 · 非公司指引</span></div>
           <button className="button button-dark full-button" disabled={saving || threshold === stock.buyThreshold} onClick={save}><Save size={16} />{saving ? '正在保存…' : threshold === stock.buyThreshold ? '当前门槛已保存' : '保存为我的研究门槛'}</button>
+          {saveError && <p className="form-error" role="alert">{saveError}</p>}
         </div>
 
         <div className="lab-result">

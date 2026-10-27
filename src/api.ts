@@ -29,7 +29,7 @@ export const api = {
   catalog: () => request<CatalogItem[]>('/api/catalog'),
   stock: (symbol: string) => request<StockDetailResponse>(`/api/stocks/${symbol}`),
   updateSettings: (symbol: string, patch: SettingsPatch) =>
-    request<Stock>(`/api/stocks/${symbol}`, {
+    request<Stock>(`/api/stocks/${symbol}/settings`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),

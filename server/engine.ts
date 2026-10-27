@@ -1,4 +1,6 @@
 import type {
+  AssumptionInput,
+  DividendAssumption,
   DividendRecord,
   PlanTier,
   Portfolio,
@@ -11,6 +13,14 @@ import type {
   Stock,
   TradeRequest,
 } from '../shared/types.ts';
+import {
+  FORECAST_BASE_YEAR,
+  REQUIRE_YIELD_MAX,
+  REQUIRE_YIELD_MIN,
+  isDividendScenario,
+  projectedDividendPerShare,
+  researchPrice,
+} from '../shared/assumptions.ts';
 
 export const AS_OF = '2026-10-23';
 export const DATA_NOTICE = '演示数据，不构成实时行情或投资建议';
@@ -19,17 +29,37 @@ export const ADVICE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export interface Holding {
   shares: number;
   cost: number;
+  /** 建仓时记录的已保存假设版本，null 表示按默认假设建仓。 */
+  assumptionVersion: number | null;
+}
+
+/** 已发送的提醒记录，仅用于抑制重复通知，不参与研究结论计算。 */
+export interface AdviceNotice {
+  level: ResearchLevel;
+  /** 提醒发送时生效的假设版本；假设变化即重新评估提醒资格。 */
+  assumptionVersion: number;
+  /** 提醒发送时的人工风险核验状态；状态变化即重新评估提醒资格。 */
+  riskVerified: boolean;
+  at: number;
+}
+
+export interface ReminderDecision {
+  notify: boolean;
+  reason: string;
 }
 
 export interface DemoState {
   stocks: Map<string, Stock>;
   histories: Map<string, PriceBar[]>;
   dividends: Map<string, DividendRecord[]>;
+  /** 已保存的分红假设，按股票代码索引；临时预览不写入这里。 */
+  assumptions: Map<string, DividendAssumption>;
   risks: RiskEvent[];
   watchlist: Set<string>;
   cash: number;
   holdings: Map<string, Holding>;
-  lastAdvices: Map<string, { level: ResearchLevel; at: number }>;
+  /** 提醒冷却记录：只影响提醒事件，绝不改变等级、动作与原因。 */
+  lastNotices: Map<string, AdviceNotice>;
 }
 
 interface StockSeed {
@@ -62,6 +92,13 @@ export class TradeError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'TradeError';
+  }
+}
+
+export class AssumptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AssumptionError';
   }
 }
 
@@ -290,10 +327,8 @@ export function deriveResearchLevel(
 }
 
 export function buildResearchPlan(
-  stock: Pick<
-    Stock,
-    'forecastDividend' | 'buyThreshold' | 'level' | 'riskVerified'
-  >,
+  stock: Pick<Stock, 'level' | 'riskVerified'>,
+  assumption: DividendAssumption,
 ): PlanTier[] {
   const levelRank: Record<ResearchLevel, number> = { L0: 0, L1: 1, L2: 2, L3: 3 };
   const definitions: Array<{
@@ -309,10 +344,10 @@ export function buildResearchPlan(
   ];
 
   return definitions.map((definition) => {
-    const yieldThreshold = (stock.buyThreshold + definition.premium) / 100;
-    const targetPrice = round(stock.forecastDividend / yieldThreshold);
+    const yieldPercent = assumption.requiredYield + definition.premium;
+    const targetPrice = researchPrice(assumption.dividendPerShare, yieldPercent);
     const conditions = [
-      `预测股息率达到${(stock.buyThreshold + definition.premium).toFixed(2)}%研究门槛`,
+      `${assumption.forecastYear}年预测股息率达到${yieldPercent.toFixed(2)}%研究门槛`,
       `%B不高于${definition.percentB.toFixed(2)}，确认布林超跌条件`,
       definition.level === 'L3'
         ? '仅当riskVerified=true且风险事项完成人工核验后解锁'
@@ -322,7 +357,7 @@ export function buildResearchPlan(
     return {
       level: definition.level,
       name: definition.name,
-      yieldThreshold,
+      yieldThreshold: yieldPercent / 100,
       targetPrice,
       shares: definition.shares,
       estimatedAmount: round(targetPrice * definition.shares),
@@ -330,8 +365,138 @@ export function buildResearchPlan(
       unlocked:
         levelRank[stock.level] >= levelRank[definition.level] &&
         (definition.level !== 'L3' || stock.riskVerified),
+      assumptionVersion: assumption.version,
     };
   });
+}
+
+/** 校验并规范化客户端提交的假设输入。 */
+export function parseAssumptionInput(body: unknown): AssumptionInput {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new AssumptionError('请求体必须为JSON对象');
+  }
+  const { forecastYear, scenario, requiredYield } = body as Partial<AssumptionInput>;
+  if (
+    typeof forecastYear !== 'number' ||
+    !Number.isInteger(forecastYear) ||
+    forecastYear < 2020 ||
+    forecastYear > 2035
+  ) {
+    throw new AssumptionError('预测年度必须在2020到2035之间');
+  }
+  if (!isDividendScenario(scenario)) {
+    throw new AssumptionError('分红情景必须为conservative、base或optimistic');
+  }
+  if (
+    typeof requiredYield !== 'number' ||
+    !Number.isFinite(requiredYield) ||
+    requiredYield < REQUIRE_YIELD_MIN ||
+    requiredYield > REQUIRE_YIELD_MAX
+  ) {
+    throw new AssumptionError(`要求股息率必须在${REQUIRE_YIELD_MIN}到${REQUIRE_YIELD_MAX}之间`);
+  }
+  return { forecastYear, scenario, requiredYield };
+}
+
+function composeAssumption(
+  state: DemoState,
+  symbol: string,
+  input: AssumptionInput,
+  savedAt: number | null,
+): DividendAssumption {
+  const stock = state.stocks.get(symbol)!;
+  const dividends = state.dividends.get(symbol) ?? [];
+  return {
+    symbol,
+    forecastYear: input.forecastYear,
+    scenario: input.scenario,
+    dividendPerShare: projectedDividendPerShare(
+      stock.baseDividend,
+      dividends,
+      input.forecastYear,
+      input.scenario,
+    ),
+    requiredYield: input.requiredYield,
+    version: (state.assumptions.get(symbol)?.version ?? 0) + 1,
+    savedAt: savedAt === null ? null : new Date(savedAt).toISOString(),
+  };
+}
+
+/** 当前生效的假设：已保存优先，否则回落到股票默认口径。 */
+export function resolveAssumption(state: DemoState, symbol: string): DividendAssumption {
+  const saved = state.assumptions.get(symbol);
+  if (saved) return saved;
+  const stock = state.stocks.get(symbol);
+  if (!stock) throw new Error('未知股票代码');
+  return {
+    symbol,
+    forecastYear: FORECAST_BASE_YEAR,
+    scenario: 'base',
+    dividendPerShare: stock.forecastDividend,
+    requiredYield: stock.buyThreshold,
+    version: 0,
+    savedAt: null,
+  };
+}
+
+/** 临时预览：按同一公式计算，但不写入状态、不递增版本。 */
+export function previewAssumption(
+  state: DemoState,
+  symbol: string,
+  input: AssumptionInput,
+): { assumption: DividendAssumption; plan: PlanTier[] } {
+  const stock = state.stocks.get(symbol);
+  if (!stock) throw new AssumptionError('未知股票代码');
+  const assumption = composeAssumption(state, symbol, input, null);
+  return { assumption, plan: buildResearchPlan(stock, assumption) };
+}
+
+function applyAssumption(state: DemoState, assumption: DividendAssumption): void {
+  state.assumptions.set(assumption.symbol, assumption);
+  const stock = state.stocks.get(assumption.symbol);
+  if (!stock) return;
+  state.stocks.set(assumption.symbol, {
+    ...stock,
+    forecastDividend: assumption.dividendPerShare,
+    buyThreshold: assumption.requiredYield,
+    assumptionVersion: assumption.version,
+  });
+}
+
+/** 保存正式假设：同步写回股票的研究口径，返回新版本。 */
+export function saveAssumption(
+  state: DemoState,
+  symbol: string,
+  input: AssumptionInput,
+  now = Date.now(),
+): DividendAssumption {
+  if (!state.stocks.has(symbol)) throw new AssumptionError('未知股票代码');
+  const assumption = composeAssumption(state, symbol, input, now);
+  applyAssumption(state, assumption);
+  return assumption;
+}
+
+/** 服务启动时恢复已持久化的假设，保证重启后口径不变。 */
+export function hydrateAssumptions(state: DemoState, records: DividendAssumption[]): void {
+  for (const record of records) {
+    if (!record || typeof record.symbol !== 'string' || !state.stocks.has(record.symbol)) continue;
+    if (!isDividendScenario(record.scenario)) continue;
+    if (!Number.isFinite(record.dividendPerShare) || record.dividendPerShare <= 0) continue;
+    if (
+      !Number.isFinite(record.requiredYield) ||
+      record.requiredYield < REQUIRE_YIELD_MIN ||
+      record.requiredYield > REQUIRE_YIELD_MAX
+    ) {
+      continue;
+    }
+    if (!Number.isInteger(record.version) || record.version <= 0) continue;
+
+    state.assumptions.set(record.symbol, record);
+    const stock = state.stocks.get(record.symbol)!;
+    stock.forecastDividend = record.dividendPerShare;
+    stock.buyThreshold = record.requiredYield;
+    stock.assumptionVersion = record.version;
+  }
 }
 
 function buildSignals(
@@ -488,13 +653,14 @@ export function createDemoState(): DemoState {
     stocks: new Map(),
     histories: new Map(),
     dividends: new Map(),
+    assumptions: new Map(),
     risks: buildRiskEvents(),
     watchlist: new Set(['601318.SH', '600941.SH', '000333.SZ']),
     cash: 50_000,
     holdings: new Map([
-      ['601318.SH', { shares: 2000, cost: 48.2 }],
+      ['601318.SH', { shares: 2000, cost: 48.2, assumptionVersion: null }],
       ...STOCK_SEEDS.filter((seed) => seed.symbol !== '601318.SH').map(
-        (seed) => [seed.symbol, { shares: 0, cost: 0 }] as const,
+        (seed) => [seed.symbol, { shares: 0, cost: 0, assumptionVersion: null }] as const,
       ),
     ]),
     lastAdvices: new Map(),
@@ -512,9 +678,11 @@ export function createDemoState(): DemoState {
       sector: seed.sector,
       price: seed.price,
       changePct,
+      baseDividend: seed.forecastDividend,
       forecastDividend: seed.forecastDividend,
       dividendYield: 0,
       buyThreshold: seed.buyThreshold,
+      assumptionVersion: 0,
       payoutRatio: seed.payoutRatio,
       dividendStreak: seed.dividendStreak,
       pe: seed.pe,
@@ -594,6 +762,7 @@ export function getPortfolio(state: DemoState): Portfolio {
       weight: 0,
       yieldOnCost: holding.cost > 0 ? round((stock.forecastDividend / holding.cost) * 100) : 0,
       annualDividend: positionDividend,
+      assumptionVersion: holding.assumptionVersion,
     });
   }
 
@@ -639,6 +808,7 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
       (holding.shares * holding.cost + request.shares * request.price) / newShares;
     holding.shares = newShares;
     holding.cost = round(newCost, 4);
+    holding.assumptionVersion = state.assumptions.get(request.symbol)?.version ?? null;
     state.cash = round(state.cash - amount);
   } else {
     if (request.shares > holding.shares) {

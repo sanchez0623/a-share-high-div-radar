@@ -15,7 +15,12 @@ import {
   WalletCards,
   X,
 } from 'lucide-react';
-import type { DashboardResponse, StockDetailResponse } from '../shared/types.ts';
+import type {
+  AssumptionInput,
+  AssumptionPreviewResponse,
+  DashboardResponse,
+  StockDetailResponse,
+} from '../shared/types.ts';
 import { api } from './api.ts';
 import { ChecklistModal, TradeModal, WatchlistModal } from './components/AppModals.tsx';
 import { ErrorScreen, LoadingScreen, Toast } from './components/UI.tsx';
@@ -42,6 +47,7 @@ const navigation = [
 export default function App() {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [detail, setDetail] = useState<StockDetailResponse | null>(null);
+  const [preview, setPreview] = useState<AssumptionPreviewResponse | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState('601318.SH');
   const [view, setView] = useState<View>('dashboard');
   const [loading, setLoading] = useState(true);
@@ -90,6 +96,7 @@ export default function App() {
 
   const selectStock = (symbol: string) => {
     setSelectedSymbol(symbol);
+    setPreview(null);
     setSearch('');
     navigate('detail');
   };
@@ -106,15 +113,26 @@ export default function App() {
     }
   };
 
-  const saveThreshold = async (threshold: number) => {
-    await api.updateSettings(selectedSymbol, { buyThreshold: threshold });
-    const [dashboard, stockDetail] = await Promise.all([
-      api.dashboard(),
-      api.stock(selectedSymbol),
-    ]);
-    setData(dashboard);
-    setDetail(stockDetail);
-    setToast(`研究门槛已保存为 ${threshold.toFixed(1)}%`);
+  const saveAssumption = async (input: AssumptionInput) => {
+    const updated = await api.saveAssumption(selectedSymbol, input);
+    setDetail(updated);
+    setPreview(null);
+    await loadData();
+    setToast(`分红假设已保存为 v${updated.assumption.version}，计划价格已按该版本重算`);
+    navigate('plan');
+  };
+
+  const previewAssumption = async (input: AssumptionInput) => {
+    const result = await api.previewAssumption(selectedSymbol, input);
+    setPreview(result);
+    setToast(`已生成临时价格阶梯（保存后为 v${result.assumption.version}）`);
+    navigate('plan');
+  };
+
+  const savePreview = async () => {
+    if (!preview) return;
+    const { forecastYear, scenario, requiredYield } = preview.assumption;
+    await saveAssumption({ forecastYear, scenario, requiredYield });
   };
 
   const acknowledgeRisk = async (id: string) => {
@@ -178,8 +196,8 @@ export default function App() {
         <main className="main-content">
           {view === 'dashboard' && <Dashboard data={data} onSelect={selectStock} onManage={() => setModal('watchlist')} />}
           {view === 'detail' && (detail ? <StockDetail detail={detail} stocks={data.stocks} onSelect={selectStock} onBack={() => navigate('dashboard')} onOpenPlan={() => navigate('plan')} /> : detailLoading)}
-          {view === 'lab' && (detail ? <DividendLab detail={detail} stocks={data.stocks} onSelect={selectStock} onSave={saveThreshold} onOpenPlan={() => navigate('plan')} /> : detailLoading)}
-          {view === 'plan' && (detail ? <PlanPage detail={detail} stocks={data.stocks} onSelect={selectStock} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
+          {view === 'lab' && (detail ? <DividendLab detail={detail} stocks={data.stocks} onSelect={selectStock} onSave={saveAssumption} onPreview={previewAssumption} /> : detailLoading)}
+          {view === 'plan' && (detail ? <PlanPage detail={detail} stocks={data.stocks} onSelect={selectStock} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
           {view === 'risk' && <RiskPage data={data} onAcknowledge={acknowledgeRisk} />}
           {view === 'portfolio' && <PortfolioPage data={data} onTrade={() => setModal('trade')} />}
           {view === 'blueprint' && <BlueprintPage />}
@@ -188,7 +206,7 @@ export default function App() {
 
       {modal === 'watchlist' && <WatchlistModal onClose={() => setModal(null)} onChanged={loadData} />}
       {modal === 'trade' && <TradeModal stocks={data.stocks} initialSymbol={selectedSymbol} onClose={() => setModal(null)} onTraded={async () => { await loadData(); setToast('模拟交易已记录，组合现金流已更新'); }} />}
-      {modal === 'checklist' && detail && <ChecklistModal detail={detail} onClose={() => setModal(null)} onCopied={() => setToast('研究清单已复制到剪贴板')} />}
+      {modal === 'checklist' && detail && <ChecklistModal detail={detail} preview={preview} onClose={() => setModal(null)} onCopied={() => setToast('研究清单已复制到剪贴板')} />}
       {toast && <Toast message={toast} onClose={() => setToast('')} />}
     </div>
   );

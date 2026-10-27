@@ -1,31 +1,61 @@
 import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type {
+  AssumptionPreviewResponse,
   CatalogItem,
   DashboardResponse,
   SettingsPatch,
+  Stock,
   StockDetailResponse,
   TradeRequest,
 } from '../shared/types.ts';
 import {
   AS_OF,
+  AssumptionError,
   DATA_NOTICE,
   TradeError,
   buildResearchPlan,
   executeTrade,
   getPortfolio,
+  hydrateAssumptions,
+  parseAssumptionInput,
+  previewAssumption,
   refreshStock,
+  resolveAssumption,
+  saveAssumption,
   type DemoState,
 } from './engine.ts';
+import { createMemoryAssumptionStore, type AssumptionStore } from './assumption-store.ts';
 
 function normalizeSymbol(value: unknown): string {
   return typeof value === 'string' ? value.trim().toUpperCase() : '';
 }
 
-export function createApp(state: DemoState) {
+export function createApp(
+  state: DemoState,
+  store: AssumptionStore = createMemoryAssumptionStore(),
+) {
   const app = express();
   app.use(cors());
   app.use(express.json());
+
+  hydrateAssumptions(state, store.load());
+
+  function persistAssumptions(): void {
+    store.save(Array.from(state.assumptions.values()));
+  }
+
+  function buildDetail(stock: Stock): StockDetailResponse {
+    const assumption = resolveAssumption(state, stock.symbol);
+    return {
+      stock,
+      history: state.histories.get(stock.symbol)!,
+      dividends: state.dividends.get(stock.symbol)!,
+      plan: buildResearchPlan(stock, assumption),
+      assumption,
+      assumptionSaved: state.assumptions.has(stock.symbol),
+    };
+  }
 
   function getCatalog(): CatalogItem[] {
     return Array.from(state.stocks.values(), (stock) => ({
@@ -69,14 +99,50 @@ export function createApp(state: DemoState) {
       return;
     }
 
-    const stock = refreshStock(state, symbol);
-    const response: StockDetailResponse = {
-      stock,
-      history: state.histories.get(symbol)!,
-      dividends: state.dividends.get(symbol)!,
-      plan: buildResearchPlan(stock),
-    };
-    res.json(response);
+    res.json(buildDetail(refreshStock(state, symbol)));
+  });
+
+  app.post('/api/stocks/:symbol/assumption', (req, res) => {
+    const symbol = normalizeSymbol(req.params.symbol);
+    if (!state.stocks.has(symbol)) {
+      res.status(404).json({ error: '股票代码不存在' });
+      return;
+    }
+
+    try {
+      saveAssumption(state, symbol, parseAssumptionInput(req.body));
+      persistAssumptions();
+      res.json(buildDetail(refreshStock(state, symbol)));
+    } catch (error) {
+      if (error instanceof AssumptionError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  app.post('/api/stocks/:symbol/assumption/preview', (req, res) => {
+    const symbol = normalizeSymbol(req.params.symbol);
+    if (!state.stocks.has(symbol)) {
+      res.status(404).json({ error: '股票代码不存在' });
+      return;
+    }
+
+    try {
+      const preview: AssumptionPreviewResponse = previewAssumption(
+        state,
+        symbol,
+        parseAssumptionInput(req.body),
+      );
+      res.json(preview);
+    } catch (error) {
+      if (error instanceof AssumptionError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.patch('/api/stocks/:symbol/settings', (req, res) => {
@@ -108,6 +174,15 @@ export function createApp(state: DemoState) {
     }
 
     state.stocks.set(symbol, { ...current, ...patch });
+    const saved = state.assumptions.get(symbol);
+    if (patch.buyThreshold !== undefined && saved) {
+      saveAssumption(state, symbol, {
+        forecastYear: saved.forecastYear,
+        scenario: saved.scenario,
+        requiredYield: patch.buyThreshold,
+      });
+      persistAssumptions();
+    }
     res.json(refreshStock(state, symbol));
   });
 

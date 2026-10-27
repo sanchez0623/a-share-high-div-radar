@@ -11,6 +11,8 @@ const layers = [
 const endpoints = [
   ['GET', '/api/dashboard', '观察仓、组合与风险总览'],
   ['GET', '/api/stocks/:symbol', '个股指标、历史与价格阶梯'],
+  ['POST', '/api/stocks/:symbol/assumption', '保存分红假设并重算研究价格'],
+  ['POST', '/api/stocks/:symbol/assumption/preview', '临时预览假设，不写回状态'],
   ['PATCH', '/api/stocks/:symbol/settings', '更新收益率门槛与风险状态'],
   ['POST', '/api/watchlist', '添加观察标的'],
   ['POST', '/api/risk/:id/acknowledge', '记录人工风险复核'],
@@ -51,6 +53,7 @@ export default function BlueprintPage() {
           <SectionHeading eyebrow="DOMAIN MODEL" title="核心领域对象" aside={<Layers3 size={20} />} />
           <div className="domain-list">
             <div><strong>Stock</strong><span>行情 + 分红假设 + 五维信号</span><p>股息率只由 forecastDividend / price 推导。</p></div>
+            <div><strong>DividendAssumption</strong><span>年度 + 情景 + 每股分红 + 要求股息率 + 版本</span><p>实验室、计划与交易共用同一版本，重启后从磁盘恢复。</p></div>
             <div><strong>Signal</strong><span>估值 / 超跌 / 趋势 / 风险 / 预算</span><p>独立状态，不允许总分掩盖风险阻断。</p></div>
             <div><strong>PlanTier</strong><span>门槛 + 研究价 + 条件 + 解锁状态</span><p>研究价 = 预测每股分红 ÷ 目标股息率。</p></div>
             <div><strong>Portfolio</strong><span>现金 + 持仓 + 预计现金流</span><p>交易校验整百股、现金与持仓约束。</p></div>

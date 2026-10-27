@@ -1,8 +1,14 @@
 import { useEffect, useState } from 'react';
 import { Check, Clipboard, Minus, Plus, Search } from 'lucide-react';
-import type { CatalogItem, Stock, StockDetailResponse } from '../../shared/types.ts';
+import type {
+  AssumptionPreviewResponse,
+  CatalogItem,
+  Stock,
+  StockDetailResponse,
+} from '../../shared/types.ts';
+import { scenarioMeta } from '../../shared/assumptions.ts';
 import { api } from '../api.ts';
-import { money, percent } from '../format.ts';
+import { money, number, percent } from '../format.ts';
 import { LevelBadge, Modal } from './UI.tsx';
 
 export function WatchlistModal({ onClose, onChanged }: { onClose: () => void; onChanged: () => Promise<void> }) {
@@ -87,18 +93,33 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
         <label className="field"><span>成交价格（元）</span><input type="number" min="0.01" step="0.01" value={price} onChange={(event) => setPrice(Number(event.target.value))} /></label>
       </div>
       <div className="trade-summary"><span>预计{side === 'buy' ? '支付' : '收回'}</span><strong>{money(shares * price)}</strong></div>
+      <div className="assumption-note trade-assumption">
+        <span>本笔交易记录的研究假设</span>
+        <strong>{stock.assumptionVersion > 0 ? `v${stock.assumptionVersion}` : '默认假设'}</strong>
+        <span>要求股息率 {percent(stock.buyThreshold, 1)}</span>
+      </div>
       {error && <p className="form-error">{error}</p>}
       <div className="modal-footer"><button className="button button-ghost" onClick={onClose}>取消</button><button className="button button-dark" disabled={busy || shares <= 0 || price <= 0} onClick={submit}>{busy ? '正在校验…' : '确认记录'}</button></div>
     </Modal>
   );
 }
 
-export function ChecklistModal({ detail, onClose, onCopied }: { detail: StockDetailResponse; onClose: () => void; onCopied: () => void }) {
-  const { stock, plan } = detail;
+export function ChecklistModal({ detail, preview, onClose, onCopied }: { detail: StockDetailResponse; preview: AssumptionPreviewResponse | null; onClose: () => void; onCopied: () => void }) {
+  const { stock } = detail;
+  const draft = preview?.assumption.symbol === stock.symbol ? preview : null;
+  const plan = draft?.plan ?? detail.plan;
+  const assumption = draft?.assumption ?? detail.assumption;
+  const versionLabel = draft
+    ? `临时假设（保存后为 v${assumption.version}）`
+    : assumption.version > 0
+      ? `v${assumption.version}`
+      : '默认假设';
+  const assumptionLine = `${assumption.forecastYear}年 · ${scenarioMeta(assumption.scenario).label}情景 · 每股分红 ¥${number(assumption.dividendPerShare)} · 要求股息率 ${percent(assumption.requiredYield, 1)}`;
   const text = [
     `【息壤研究清单】${stock.name} ${stock.symbol}`,
     `当前：¥${stock.price}，预测股息率 ${percent(stock.dividendYield)}，%B ${(stock.percentB * 100).toFixed(0)}%，等级 ${stock.level}`,
     `风险状态：${stock.riskVerified ? '已人工核验' : '待人工核验'}`,
+    `研究假设（${versionLabel}）：${assumptionLine}`,
     ...plan.flatMap((tier) => [
       `${tier.level} ${tier.name}：研究价 ${money(tier.targetPrice ?? 0)}，门槛 ${percent(tier.yieldThreshold * 100)}，参考 ${tier.shares} 股`,
       ...tier.conditions.map((condition) => `  □ ${condition}`),
@@ -123,6 +144,7 @@ export function ChecklistModal({ detail, onClose, onCopied }: { detail: StockDet
     <Modal title={`${stock.name} · 研究清单`} eyebrow="BEFORE ANY ACTION" onClose={onClose} wide>
       <div className="checklist-preview">
         <div className="checklist-stock"><LevelBadge level={stock.level} /><strong>{stock.name}</strong><span>当前 {percent(stock.dividendYield)} · %B {(stock.percentB * 100).toFixed(0)}%</span></div>
+        <div className={`checklist-assumption ${draft ? 'draft' : ''}`}><span>{versionLabel}</span><p>{assumptionLine}</p></div>
         {plan.map((tier) => <div className="checklist-tier" key={tier.level}><div><LevelBadge level={tier.level} /><strong>{money(tier.targetPrice ?? 0)}</strong><span>{tier.shares} 股参考</span></div>{tier.conditions.map((condition) => <p key={condition}><span className="empty-checkbox" />{condition}</p>)}</div>)}
         <div className="manual-checks"><p><span className="empty-checkbox" />已阅读最新财报与分红公告原文</p><p><span className="empty-checkbox" />已检查自由现金流与派息可持续性</p><p><span className="empty-checkbox" />已确认组合现金与仓位约束</p></div>
       </div>

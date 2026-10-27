@@ -1,4 +1,6 @@
 import type {
+  AssumptionInput,
+  AssumptionPreviewResponse,
   CatalogItem,
   DashboardResponse,
   Portfolio,
@@ -28,6 +30,16 @@ export const api = {
   dashboard: () => request<DashboardResponse>('/api/dashboard'),
   catalog: () => request<CatalogItem[]>('/api/catalog'),
   stock: (symbol: string) => request<StockDetailResponse>(`/api/stocks/${symbol}`),
+  saveAssumption: (symbol: string, input: AssumptionInput) =>
+    request<StockDetailResponse>(`/api/stocks/${symbol}/assumption`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  previewAssumption: (symbol: string, input: AssumptionInput) =>
+    request<AssumptionPreviewResponse>(`/api/stocks/${symbol}/assumption/preview`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   updateSettings: (symbol: string, patch: SettingsPatch) =>
     request<Stock>(`/api/stocks/${symbol}/settings`, {
       method: 'PATCH',

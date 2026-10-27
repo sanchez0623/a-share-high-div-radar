@@ -1,6 +1,19 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowRight, Check, FlaskConical, Save } from 'lucide-react';
-import type { Stock, StockDetailResponse } from '../../shared/types.ts';
+import { Check, Eye, FlaskConical, Save } from 'lucide-react';
+import type {
+  AssumptionInput,
+  DividendScenario,
+  Stock,
+  StockDetailResponse,
+} from '../../shared/types.ts';
+import {
+  FORECAST_YEARS,
+  SCENARIOS,
+  latestDividendGrowth,
+  projectedDividendPerShare,
+  researchPrice,
+  scenarioMeta,
+} from '../../shared/assumptions.ts';
 import { DividendBars } from '../components/Charts.tsx';
 import { SectionHeading } from '../components/UI.tsx';
 import { money, number, percent } from '../format.ts';
@@ -9,45 +22,73 @@ interface Props {
   detail: StockDetailResponse;
   stocks: Stock[];
   onSelect: (symbol: string) => void;
-  onSave: (threshold: number) => Promise<void>;
-  onOpenPlan: () => void;
+  onSave: (input: AssumptionInput) => Promise<void>;
+  onPreview: (input: AssumptionInput) => Promise<void>;
 }
 
-type Scenario = 'conservative' | 'base' | 'optimistic';
-const scenarios: { key: Scenario; label: string; factor: number; note: string }[] = [
-  { key: 'conservative', label: '谨慎', factor: 0.85, note: '分红下修 15%' },
-  { key: 'base', label: '基准', factor: 1, note: '沿用当前预测' },
-  { key: 'optimistic', label: '乐观', factor: 1.1, note: '分红增长 10%' },
-];
+const tierDefinitions = [
+  { level: 'L1', name: '初步研究', premium: 0 },
+  { level: 'L2', name: '深入复核', premium: 0.5 },
+  { level: 'L3', name: '严格核验', premium: 1 },
+] as const;
 
-export default function DividendLab({ detail, stocks, onSelect, onSave, onOpenPlan }: Props) {
-  const { stock, dividends } = detail;
-  const [scenario, setScenario] = useState<Scenario>('base');
-  const [threshold, setThreshold] = useState(stock.buyThreshold);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState('');
+export default function DividendLab({ detail, stocks, onSelect, onSave, onPreview }: Props) {
+  const { stock, dividends, assumption, assumptionSaved } = detail;
+  const [scenario, setScenario] = useState<DividendScenario>(assumption.scenario);
+  const [forecastYear, setForecastYear] = useState(assumption.forecastYear);
+  const [threshold, setThreshold] = useState(assumption.requiredYield);
+  const [busy, setBusy] = useState<'save' | 'preview' | null>(null);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    setThreshold(stock.buyThreshold);
-    setScenario('base');
-    setSaveError('');
-  }, [stock.symbol, stock.buyThreshold]);
+    setScenario(assumption.scenario);
+    setForecastYear(assumption.forecastYear);
+    setThreshold(assumption.requiredYield);
+    setBusy(null);
+    setError('');
+  }, [
+    stock.symbol,
+    assumption.scenario,
+    assumption.forecastYear,
+    assumption.requiredYield,
+    assumption.version,
+  ]);
 
-  const activeScenario = scenarios.find((item) => item.key === scenario)!;
-  const estimatedDividend = stock.forecastDividend * activeScenario.factor;
-  const targetPrice = estimatedDividend / (threshold / 100);
+  const growth = latestDividendGrowth(dividends);
+  const activeScenario = scenarioMeta(scenario);
+  const dividendPerShare = useMemo(
+    () => projectedDividendPerShare(stock.baseDividend, dividends, forecastYear, scenario),
+    [stock.baseDividend, dividends, forecastYear, scenario],
+  );
+  const targetPrice = researchPrice(dividendPerShare, threshold);
   const priceGap = (targetPrice / stock.price - 1) * 100;
-  const thresholds = useMemo(() => [threshold - 0.5, threshold, threshold + 0.5, threshold + 1], [threshold]);
+  const thresholds = useMemo(
+    () => [threshold - 0.5, threshold, threshold + 0.5, threshold + 1],
+    [threshold],
+  );
 
-  const save = async () => {
-    setSaving(true);
-    setSaveError('');
+  const isSaved =
+    assumptionSaved &&
+    assumption.scenario === scenario &&
+    assumption.forecastYear === forecastYear &&
+    Math.abs(assumption.requiredYield - threshold) < 1e-9;
+  const statusLabel = isSaved
+    ? `已保存 · v${assumption.version}`
+    : assumptionSaved
+      ? `临时改动 · 基于 v${assumption.version}`
+      : '默认假设 · 未保存';
+
+  const input: AssumptionInput = { forecastYear, scenario, requiredYield: threshold };
+
+  const run = async (action: 'save' | 'preview') => {
+    setBusy(action);
+    setError('');
     try {
-      await onSave(threshold);
+      await (action === 'save' ? onSave(input) : onPreview(input));
     } catch (reason) {
-      setSaveError((reason as Error).message || '保存失败，请稍后重试');
+      setError((reason as Error).message || '操作失败，请稍后重试');
     } finally {
-      setSaving(false);
+      setBusy(null);
     }
   };
 
@@ -64,41 +105,62 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onOpenPl
         <div className="lab-controls">
           <div className="lab-stock-heading"><FlaskConical size={20} /><span>当前实验样本</span><strong>{stock.name}</strong><small>{stock.symbol}</small></div>
           <div className="control-group">
+            <div className="control-label"><label htmlFor="forecast-year">预测年度</label><output className="year-output">{forecastYear}<i>年</i></output></div>
+            <select id="forecast-year" className="year-select" value={forecastYear} onChange={(event) => { setForecastYear(Number(event.target.value)); setError(''); }}>
+              {FORECAST_YEARS.map((year) => <option key={year} value={year}>{year} 年 · 按近一年增速 {percent(growth, 2)} 外推</option>)}
+            </select>
+          </div>
+          <div className="control-group">
             <label>分红情景</label>
             <div className="scenario-tabs">
-              {scenarios.map((item) => <button key={item.key} className={scenario === item.key ? 'active' : ''} onClick={() => setScenario(item.key)}><strong>{item.label}</strong><span>{item.note}</span></button>)}
+              {SCENARIOS.map((item) => <button key={item.key} className={scenario === item.key ? 'active' : ''} onClick={() => { setScenario(item.key); setError(''); }}><strong>{item.label}</strong><span>{item.note}</span></button>)}
             </div>
           </div>
           <div className="control-group">
             <div className="control-label"><label htmlFor="yield-range">要求股息率</label><output>{percent(threshold, 1)}</output></div>
-            <input id="yield-range" type="range" min="3" max="10" step="0.1" value={threshold} onChange={(event) => { setThreshold(Number(event.target.value)); setSaveError(''); }} />
+            <input id="yield-range" type="range" min="3" max="10" step="0.1" value={threshold} onChange={(event) => { setThreshold(Number(event.target.value)); setError(''); }} />
             <div className="range-labels"><span>3.0% · 宽松</span><span>10.0% · 严格</span></div>
           </div>
-          <div className="assumption-note">预测每股分红 <strong>¥{number(estimatedDividend)}</strong><span>{activeScenario.label}情景 · 非公司指引</span></div>
-          <button className="button button-dark full-button" disabled={saving || threshold === stock.buyThreshold} onClick={save}><Save size={16} />{saving ? '正在保存…' : threshold === stock.buyThreshold ? '当前门槛已保存' : '保存为我的研究门槛'}</button>
-          {saveError && <p className="form-error" role="alert">{saveError}</p>}
+          <div className="assumption-note">
+            <strong>¥{number(dividendPerShare)}</strong>
+            <span>{forecastYear}年 · {activeScenario.label}情景 · 每股分红</span>
+            <em className={`assumption-chip ${isSaved ? 'saved' : 'draft'}`}>{statusLabel}</em>
+          </div>
+          <div className="assumption-actions">
+            <button className="button button-dark" disabled={busy !== null || isSaved} onClick={() => run('save')}><Save size={16} />{busy === 'save' ? '正在保存…' : '保存并生成计划'}</button>
+            <button className="button button-secondary" disabled={busy !== null} onClick={() => run('preview')}><Eye size={16} />{busy === 'preview' ? '正在生成…' : '仅临时预览'}</button>
+          </div>
+          {isSaved && <p className="assumption-hint">该假设已保存为 v{assumption.version}，实验室与计划页共用同一套研究价格。</p>}
+          {!assumptionSaved && <p className="assumption-hint">尚未保存假设，当前按原始预测与默认门槛计算。</p>}
+          {error && <p className="form-error" role="alert">{error}</p>}
         </div>
 
         <div className="lab-result">
           <span className="eyebrow light">REVERSE VALUATION</span>
           <p>在这个情景下，你的研究价格是</p>
           <strong className="lab-target-price">{money(targetPrice)}</strong>
-          <div className="formula-line"><span>¥{number(estimatedDividend)}</span><i>÷</i><span>{percent(threshold, 1)}</span><i>=</i><b>{money(targetPrice)}</b></div>
+          <div className="formula-line"><span>¥{number(dividendPerShare)}</span><i>÷</i><span>{percent(threshold, 1)}</span><i>=</i><b>{money(targetPrice)}</b></div>
+          <div className="lab-tier-strip">
+            {tierDefinitions.map((tier) => <div key={tier.level}><span>{tier.level} {tier.name}</span><strong>{money(researchPrice(dividendPerShare, threshold + tier.premium))}</strong></div>)}
+          </div>
           <div className={`price-gap ${priceGap < 0 ? 'negative' : ''}`}>
             <span>较当前价 {stock.price.toFixed(2)} 元</span>
             <strong>{priceGap >= 0 ? '+' : ''}{percent(priceGap, 1)}</strong>
             <small>{priceGap < 0 ? '仍需等待价格回落' : '当前价格已低于研究价'}</small>
           </div>
-          <button className="text-link light-link" onClick={onOpenPlan}>用这个门槛生成价格阶梯<ArrowRight size={15} /></button>
+          <p className="lab-tier-note">三档价格与计划页同源，均按本页假设推导。</p>
         </div>
       </section>
 
       <section className="panel sensitivity-panel">
-        <SectionHeading eyebrow="SENSITIVITY MATRIX" title="一格假设变化，价格答案就不同" aside={<span className="outline-tag">单位：元 / 股</span>} />
+        <SectionHeading eyebrow="SENSITIVITY MATRIX" title="一格假设变化，价格答案就不同" aside={<span className="outline-tag">单位：元 / 股 · {forecastYear}年</span>} />
         <div className="table-scroll">
           <table className="sensitivity-table">
             <thead><tr><th>分红情景</th>{thresholds.map((value, index) => <th key={value} className={index === 1 ? 'highlight-column' : ''}>股息率 {percent(value, 1)}</th>)}</tr></thead>
-            <tbody>{scenarios.map((item) => <tr key={item.key} className={scenario === item.key ? 'active-row' : ''}><td><strong>{item.label}</strong><span>¥{number(stock.forecastDividend * item.factor)} / 股</span></td>{thresholds.map((value, index) => { const price = stock.forecastDividend * item.factor / (value / 100); return <td key={value} className={index === 1 ? 'highlight-column' : ''}><strong>{number(price)}</strong><small className={price < stock.price ? 'down' : 'up'}>{price < stock.price ? '等待' : '已进入'}</small></td>; })}</tr>)}</tbody>
+            <tbody>{SCENARIOS.map((item) => {
+              const dividend = projectedDividendPerShare(stock.baseDividend, dividends, forecastYear, item.key);
+              return <tr key={item.key} className={scenario === item.key ? 'active-row' : ''}><td><strong>{item.label}</strong><span>¥{number(dividend)} / 股</span></td>{thresholds.map((value, index) => { const price = researchPrice(dividend, value); return <td key={value} className={index === 1 ? 'highlight-column' : ''}><strong>{number(price)}</strong><small className={price < stock.price ? 'down' : 'up'}>{price < stock.price ? '等待' : '已进入'}</small></td>; })}</tr>;
+            })}</tbody>
           </table>
         </div>
       </section>

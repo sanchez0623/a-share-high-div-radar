@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Check, Eye, FlaskConical, Save } from 'lucide-react';
+import { Eye, FlaskConical, Save } from 'lucide-react';
 import type {
   AssumptionInput,
   DividendScenario,
@@ -9,6 +9,9 @@ import type {
 import {
   FORECAST_YEARS,
   SCENARIOS,
+  buildForecastHypothesis,
+  dividendQualityLabel,
+  forecastSourceLabel,
   latestDividendGrowth,
   projectedDividendPerShare,
   researchPrice,
@@ -60,6 +63,11 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onPrevie
     () => projectedDividendPerShare(stock.baseDividend, dividends, forecastYear, scenario),
     [stock.baseDividend, dividends, forecastYear, scenario],
   );
+  const hypothesis = useMemo(
+    () => buildForecastHypothesis(stock.baseDividend, dividends, forecastYear, scenario),
+    [stock.baseDividend, dividends, forecastYear, scenario],
+  );
+  const quality = stock.dividendQuality;
   const targetPrice = researchPrice(dividendPerShare, threshold);
   const priceGap = (targetPrice / stock.price - 1) * 100;
   const thresholds = useMemo(
@@ -126,6 +134,12 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onPrevie
             <span>{forecastYear}年 · {activeScenario.label}情景 · 每股分红</span>
             <em className={`assumption-chip ${isSaved ? 'saved' : 'draft'}`}>{statusLabel}</em>
           </div>
+          <div className="forecast-trace">
+            <p><span>预测来源</span><strong>{forecastSourceLabel(stock.baseForecast.source)}</strong></p>
+            <p><span>报告期</span><strong>{stock.baseForecast.reportPeriod}</strong></p>
+            <p><span>公告日期</span><strong>{stock.baseForecast.announcementDate ?? '无（非公告口径）'}</strong></p>
+            <p className="wide"><span>假设说明</span><strong>{hypothesis}</strong></p>
+          </div>
           <div className="assumption-actions">
             <button className="button button-dark" disabled={busy !== null || isSaved} onClick={() => run('save')}><Save size={16} />{busy === 'save' ? '正在保存…' : '保存并生成计划'}</button>
             <button className="button button-secondary" disabled={busy !== null} onClick={() => run('preview')}><Eye size={16} />{busy === 'preview' ? '正在生成…' : '仅临时预览'}</button>
@@ -167,13 +181,23 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onPrevie
 
       <section className="lab-bottom-grid">
         <div className="panel">
-          <SectionHeading eyebrow="QUALITY CHECK" title="高股息，先要能持续" />
+          <SectionHeading eyebrow="QUALITY CHECK" title="高股息，先要能持续" aside={<span className="outline-tag">分红质量 {dividendQualityLabel(quality.status)}</span>} />
           <div className="quality-metrics">
-            <div><span>演示派息率</span><strong>{percent(stock.payoutRatio, 0)}</strong><div className="quality-track"><i style={{ width: `${Math.min(stock.payoutRatio, 100)}%` }} /></div><small>{stock.payoutRatio > 80 ? '偏高，需核验现金覆盖' : '处于可研究区间'}</small></div>
+            <div><span>派息率（年报）</span><strong>{percent(quality.payoutRatio, 0)}</strong><div className="quality-track"><i style={{ width: `${Math.min(quality.payoutRatio, 100)}%` }} /></div><small>{quality.checks[0].detail}</small></div>
+            <div><span>自由现金流覆盖</span><strong>{number(quality.freeCashFlowCoverage)}<i>×</i></strong><small>经营现金流覆盖 {number(quality.operatingCashFlowCoverage)}×</small></div>
             <div><span>连续分红</span><strong>{stock.dividendStreak}<i>年</i></strong><small>连续性不等于未来承诺</small></div>
-            <div><span>ROE</span><strong>{percent(stock.roe, 1)}</strong><small>需结合杠杆与利润质量</small></div>
           </div>
-          <ul className="research-checklist"><li><Check size={15} />分红是否由自由现金流覆盖？</li><li><Check size={15} />派息率提升是否来自一次性收益？</li><li><Check size={15} />行业资本开支是否将挤压未来分红？</li></ul>
+          <ul className="quality-check-list">
+            {quality.checks.map((check) => (
+              <li key={check.key} className={`status-${check.status}`}>
+                <span className="quality-dot" />
+                <strong>{check.label}</strong>
+                <em>{check.value}</em>
+                <small>{check.detail}</small>
+              </li>
+            ))}
+          </ul>
+          {quality.notes.length > 0 && <ul className="quality-notes">{quality.notes.map((note) => <li key={note}>{note}</li>)}</ul>}
         </div>
         <div className="panel">
           <SectionHeading eyebrow="FIVE-YEAR RECORD" title="历史分红轨迹" />

@@ -4,6 +4,11 @@ import type {
   AssumptionPreviewResponse,
   CatalogItem,
   DashboardResponse,
+  RiskEvent,
+  RiskEventInput,
+  RiskMutationResponse,
+  RiskSourcePatch,
+  RiskVerificationInput,
   SettingsPatch,
   Stock,
   StockDetailResponse,
@@ -12,21 +17,37 @@ import type {
 import {
   AS_OF,
   AssumptionError,
+  DATA_META,
   DATA_NOTICE,
+  RISK_POLICY,
+  RiskError,
   TradeError,
+  addRiskEvent,
+  buildAllocation,
   buildResearchPlan,
   dispatchReminder,
   executeTrade,
   getPortfolio,
+  getRiskEvents,
   getStockSnapshot,
   hydrateAssumptions,
+  hydratePortfolio,
+  hydrateRisks,
   parseAssumptionInput,
   previewAssumption,
   resolveAssumption,
+  reviewTrades,
   saveAssumption,
+  updateRiskSource,
+  verifyRisk,
   type DemoState,
 } from './engine.ts';
 import { createMemoryAssumptionStore, type AssumptionStore } from './assumption-store.ts';
+import { createMemoryRiskStore, type RiskStore } from './risk-store.ts';
+import {
+  createMemoryPortfolioStore,
+  type PortfolioStore,
+} from './portfolio-store.ts';
 
 function normalizeSymbol(value: unknown): string {
   return typeof value === 'string' ? value.trim().toUpperCase() : '';
@@ -35,26 +56,59 @@ function normalizeSymbol(value: unknown): string {
 export function createApp(
   state: DemoState,
   store: AssumptionStore = createMemoryAssumptionStore(),
+  riskStore: RiskStore = createMemoryRiskStore(),
+  portfolioStore: PortfolioStore = createMemoryPortfolioStore(),
 ) {
   const app = express();
   app.use(cors());
   app.use(express.json());
 
   hydrateAssumptions(state, store.load());
+  hydrateRisks(state, riskStore.load());
+  hydratePortfolio(state, portfolioStore.load());
 
   function persistAssumptions(): void {
     store.save(Array.from(state.assumptions.values()));
   }
 
-  function buildDetail(stock: Stock): StockDetailResponse {
+  function persistRisks(): void {
+    riskStore.save(state.risks);
+  }
+
+  function persistPortfolio(): void {
+    portfolioStore.save({
+      watchlist: Array.from(state.watchlist),
+      cash: state.cash,
+      holdings: Array.from(state.holdings, ([symbol, holding]) => ({
+        symbol,
+        shares: holding.shares,
+        cost: holding.cost,
+        assumptionVersion: holding.assumptionVersion,
+      })),
+      trades: state.trades,
+    });
+  }
+
+  /** 风险写操作统一返回最新风险事件与重算后的股票闸门。 */
+  function respondWithRisk(res: Response, risk: RiskEvent): void {
+    const stock = getStockSnapshot(state, risk.symbol);
+    dispatchReminder(state, stock);
+    const response: RiskMutationResponse = { risk, stock };
+    res.json(response);
+  }
+
+  function buildDetail(stock: Stock, budget?: number): StockDetailResponse {
     const assumption = resolveAssumption(state, stock.symbol);
+    const plan = buildResearchPlan(stock, assumption);
     return {
       stock,
       history: state.histories.get(stock.symbol)!,
       dividends: state.dividends.get(stock.symbol)!,
-      plan: buildResearchPlan(stock, assumption),
+      plan,
       assumption,
       assumptionSaved: state.assumptions.has(stock.symbol),
+      /** 分配：以已到账现金、最低储备与集中度上限为约束；budget 缺省用可投入现金。 */
+      allocation: buildAllocation(state, stock.symbol, plan, budget),
     };
   }
 
@@ -70,9 +124,10 @@ export function createApp(
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
-      dataMode: 'demo',
+      dataMode: DATA_META.dataMode,
       asOf: AS_OF,
       dataNotice: DATA_NOTICE,
+      dataMeta: DATA_META,
     });
   });
 
@@ -82,8 +137,10 @@ export function createApp(
       dataMode: 'demo',
       stocks: Array.from(state.watchlist, (symbol) => getStockSnapshot(state, symbol)),
       portfolio: getPortfolio(state),
-      risks: state.risks,
+      risks: getRiskEvents(state),
+      riskPolicy: RISK_POLICY,
       dataNotice: DATA_NOTICE,
+      dataMeta: DATA_META,
     };
     res.json(response);
   });
@@ -100,7 +157,9 @@ export function createApp(
       return;
     }
 
-    res.json(buildDetail(getStockSnapshot(state, symbol)));
+    const rawBudget = typeof req.query.budget === 'string' ? Number(req.query.budget) : NaN;
+    const budget = Number.isFinite(rawBudget) && rawBudget >= 0 ? rawBudget : undefined;
+    res.json(buildDetail(getStockSnapshot(state, symbol), budget));
   });
 
   app.post('/api/stocks/:symbol/assumption', (req, res) => {
@@ -160,7 +219,11 @@ export function createApp(
       return;
     }
 
-    const patch = req.body as SettingsPatch;
+    const patch = req.body as SettingsPatch & { riskVerified?: unknown };
+    if (patch.riskVerified !== undefined) {
+      res.status(400).json({ error: '风险状态由风险事件核验派生，请在风险哨兵中逐条核验' });
+      return;
+    }
     if (
       patch.buyThreshold !== undefined &&
       (typeof patch.buyThreshold !== 'number' ||
@@ -171,12 +234,8 @@ export function createApp(
       res.status(400).json({ error: 'buyThreshold必须在3到10之间' });
       return;
     }
-    if (patch.riskVerified !== undefined && typeof patch.riskVerified !== 'boolean') {
-      res.status(400).json({ error: 'riskVerified必须为布尔值' });
-      return;
-    }
 
-    state.stocks.set(symbol, { ...current, ...patch });
+    state.stocks.set(symbol, { ...current, buyThreshold: patch.buyThreshold ?? current.buyThreshold });
     const saved = state.assumptions.get(symbol);
     if (patch.buyThreshold !== undefined && saved) {
       saveAssumption(state, symbol, {
@@ -198,6 +257,7 @@ export function createApp(
       return;
     }
     state.watchlist.add(symbol);
+    persistPortfolio();
     res.json(getCatalog());
   });
 
@@ -212,28 +272,67 @@ export function createApp(
       return;
     }
     state.watchlist.delete(symbol);
+    persistPortfolio();
     res.json(getCatalog());
   });
 
-  app.post('/api/risk/:id/acknowledge', (req, res) => {
-    const risk = state.risks.find((item) => item.id === req.params.id);
-    if (!risk) {
+  /** 逐条记录人工核验：备注必填、高风险必须留证据、有效期由公开政策决定。 */
+  app.post('/api/risk/:id/verify', (req, res) => {
+    if (!state.risks.some((item) => item.id === req.params.id)) {
       res.status(404).json({ error: '风险事项不存在' });
       return;
     }
-
-    risk.status = 'acknowledged';
-    const stock = state.stocks.get(risk.symbol);
-    if (stock) {
-      stock.riskVerified = true;
-      dispatchReminder(state, getStockSnapshot(state, stock.symbol));
+    try {
+      const risk = verifyRisk(state, req.params.id, req.body as RiskVerificationInput);
+      persistRisks();
+      respondWithRisk(res, risk);
+    } catch (error) {
+      if (error instanceof RiskError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
     }
-    res.json(risk);
+  });
+
+  /** 登记新的风险事项；高风险会让该股票既有核验全部失效。 */
+  app.post('/api/risk', (req, res) => {
+    try {
+      const risk = addRiskEvent(state, req.body as RiskEventInput);
+      persistRisks();
+      respondWithRisk(res, risk);
+    } catch (error) {
+      if (error instanceof RiskError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  /** 原文更新：版本号递增，本条风险的核验随即失效。 */
+  app.patch('/api/risk/:id/source', (req, res) => {
+    if (!state.risks.some((item) => item.id === req.params.id)) {
+      res.status(404).json({ error: '风险事项不存在' });
+      return;
+    }
+    try {
+      const risk = updateRiskSource(state, req.params.id, req.body as RiskSourcePatch);
+      persistRisks();
+      respondWithRisk(res, risk);
+    } catch (error) {
+      if (error instanceof RiskError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.post('/api/portfolio/trade', (req, res) => {
     try {
       const portfolio = executeTrade(state, req.body as TradeRequest);
+      persistPortfolio();
       res.json(portfolio);
     } catch (error) {
       if (error instanceof TradeError) {
@@ -244,6 +343,10 @@ export function createApp(
     }
   });
 
+  app.get('/api/portfolio/review', (_req, res) => {
+    res.json(reviewTrades(state));
+  });
+
   app.get('/api/export/watchlist', (_req, res) => {
     const headers = [
       'symbol',
@@ -251,8 +354,14 @@ export function createApp(
       'sector',
       'price',
       'forecastDividend',
+      'forecastYear',
+      'forecastSource',
+      'reportPeriod',
       'dividendYield',
       'buyThreshold',
+      'payoutRatio',
+      'fcfCoverage',
+      'qualityStatus',
       'score',
       'level',
       'action',
@@ -267,8 +376,14 @@ export function createApp(
         stock.sector,
         stock.price,
         stock.forecastDividend,
+        stock.dividendForecast.year,
+        stock.dividendForecast.source,
+        stock.dividendForecast.reportPeriod,
         stock.dividendYield,
         stock.buyThreshold,
+        stock.dividendQuality.payoutRatio,
+        stock.dividendQuality.freeCashFlowCoverage,
+        stock.dividendQuality.status,
         stock.score,
         stock.level,
         stock.action,

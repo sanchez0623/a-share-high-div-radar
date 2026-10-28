@@ -19,6 +19,8 @@ import type {
   AssumptionInput,
   AssumptionPreviewResponse,
   DashboardResponse,
+  RiskEventInput,
+  RiskVerificationInput,
   StockDetailResponse,
 } from '../shared/types.ts';
 import { api } from './api.ts';
@@ -135,10 +137,26 @@ export default function App() {
     await saveAssumption({ forecastYear, scenario, requiredYield });
   };
 
-  const acknowledgeRisk = async (id: string) => {
-    await api.acknowledgeRisk(id);
+  const verifyRisk = async (id: string, input: RiskVerificationInput) => {
+    const result = await api.verifyRisk(id, input);
     await loadData();
-    setToast('人工复核状态已记录，研究信号已重新计算');
+    setToast(`核验已记录：${result.risk.statusReason}`);
+  };
+
+  const addRisk = async (input: RiskEventInput) => {
+    const result = await api.addRisk(input);
+    await loadData();
+    setToast(
+      result.risk.severity === 'high'
+        ? '已登记高风险事项，该股票原有核验全部失效，需重新核验'
+        : `已登记风险事项：${result.risk.title}`,
+    );
+  };
+
+  const refreshRiskSource = async (id: string) => {
+    const result = await api.updateRiskSource(id, {});
+    await loadData();
+    setToast(`原文已更新至 v${result.risk.source.revision}，原核验已失效`);
   };
 
   const searchResults = useMemo(() => {
@@ -151,6 +169,7 @@ export default function App() {
   if (!data) return <ErrorScreen message={error || '未收到研究数据'} retry={() => { setLoading(true); loadData().catch(() => undefined).finally(() => setLoading(false)); }} />;
 
   const currentNav = navigation.find((item) => item.key === view);
+  const openRiskCount = data.risks.filter((risk) => risk.status !== 'verified').length;
   const pageTitle = view === 'blueprint' ? '系统架构蓝图' : currentNav?.label ?? '息壤研究台';
   const detailLoading = <div className="inline-loading"><span className="loading-spinner" />正在计算个股研究数据…</div>;
 
@@ -166,7 +185,7 @@ export default function App() {
         <nav className="main-nav" aria-label="主导航">
           {navigation.map((item, index) => {
             const Icon = item.icon;
-            return <button key={item.key} className={view === item.key ? 'active' : ''} onClick={() => navigate(item.key)}><span className="nav-index">0{index + 1}</span><Icon size={18} /><span>{item.label}</span>{item.key === 'risk' && data.risks.some((risk) => risk.status === 'pending') && <i className="nav-alert" />}</button>;
+            return <button key={item.key} className={view === item.key ? 'active' : ''} onClick={() => navigate(item.key)}><span className="nav-index">0{index + 1}</span><Icon size={18} /><span>{item.label}</span>{item.key === 'risk' && openRiskCount > 0 && <i className="nav-alert" />}</button>;
           })}
         </nav>
         <div className="sidebar-bottom">
@@ -188,7 +207,7 @@ export default function App() {
             </div>
             <button className={`icon-button topbar-button ${refreshing ? 'spinning' : ''}`} onClick={refresh} title="重新读取演示快照" aria-label="刷新数据"><RefreshCw size={17} /></button>
             <a className="icon-button topbar-button export-button" href="/api/export/watchlist" download title="导出观察仓 CSV" aria-label="导出观察仓"><Download size={17} /></a>
-            <button className="notification-button" onClick={() => navigate('risk')} aria-label="查看风险通知"><BellRing size={17} /><span>{data.risks.filter((risk) => risk.status === 'pending').length}</span></button>
+            <button className="notification-button" onClick={() => navigate('risk')} aria-label="查看风险通知"><BellRing size={17} /><span>{openRiskCount}</span></button>
             <div className="research-avatar">研</div>
           </div>
         </header>
@@ -198,7 +217,7 @@ export default function App() {
           {view === 'detail' && (detail ? <StockDetail detail={detail} stocks={data.stocks} onSelect={selectStock} onBack={() => navigate('dashboard')} onOpenPlan={() => navigate('plan')} /> : detailLoading)}
           {view === 'lab' && (detail ? <DividendLab detail={detail} stocks={data.stocks} onSelect={selectStock} onSave={saveAssumption} onPreview={previewAssumption} /> : detailLoading)}
           {view === 'plan' && (detail ? <PlanPage detail={detail} stocks={data.stocks} onSelect={selectStock} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
-          {view === 'risk' && <RiskPage data={data} onAcknowledge={acknowledgeRisk} />}
+          {view === 'risk' && <RiskPage data={data} onVerify={verifyRisk} onAddRisk={addRisk} onRefreshSource={refreshRiskSource} />}
           {view === 'portfolio' && <PortfolioPage data={data} onTrade={() => setModal('trade')} />}
           {view === 'blueprint' && <BlueprintPage />}
         </main>

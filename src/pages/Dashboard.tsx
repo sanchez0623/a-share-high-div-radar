@@ -9,6 +9,7 @@ import {
   Settings2,
 } from 'lucide-react';
 import type { DashboardResponse } from '../../shared/types.ts';
+import { forecastSourceLabel, statBasisLabel } from '../../shared/assumptions.ts';
 import { compactMoney, money, number, percent } from '../format.ts';
 import { OpportunityMap, ScoreRing, Sparkline } from '../components/Charts.tsx';
 import { LevelBadge, SectionHeading, SignalPill } from '../components/UI.tsx';
@@ -28,7 +29,7 @@ export default function Dashboard({ data, onSelect, onManage }: Props) {
     return result;
   }, [data.stocks, sortMode]);
   const queue = [...data.stocks].sort((a, b) => b.score - a.score);
-  const pendingRisks = data.risks.filter((risk) => risk.status === 'pending').length;
+  const openRisks = data.risks.filter((risk) => risk.status !== 'verified').length;
 
   return (
     <div className="page dashboard-page">
@@ -39,7 +40,7 @@ export default function Dashboard({ data, onSelect, onManage }: Props) {
           <p>把股息率当作标尺，把情绪留给别人。<br />今天只研究那些正在靠近你规则的公司。</p>
           <div className="hero-footnote">
             <span className="live-dot" />已扫描 {data.stocks.length} 只观察标的
-            <span>·</span>{pendingRisks} 项风险待复核
+            <span>·</span>{openRisks} 项风险未关闭
           </div>
         </div>
         <div className="hero-income">
@@ -56,7 +57,7 @@ export default function Dashboard({ data, onSelect, onManage }: Props) {
 
       <div className="data-ribbon">
         <div><FlaskConical size={16} /><strong>演示研究环境</strong><span>{data.dataNotice}</span></div>
-        <div><Database size={15} />快照截至 {data.asOf}<span className="ribbon-divider" />不复权口径</div>
+        <div><Database size={15} />行情 {data.dataMeta.quoteTime}<span className="ribbon-divider" />{data.dataMeta.priceAdjustment === 'forward' ? '前复权' : '不复权'}口径 · PE {statBasisLabel(data.dataMeta.peBasis)} · ROE {statBasisLabel(data.dataMeta.roeBasis)}</div>
       </div>
 
       <section className="dashboard-analysis-grid">
@@ -128,7 +129,7 @@ export default function Dashboard({ data, onSelect, onManage }: Props) {
               <div className="stock-yield">
                 <span>预测股息率</span>
                 <strong>{percent(stock.dividendYield)}</strong>
-                <small>门槛 {percent(stock.buyThreshold, 1)}</small>
+                <small>门槛 {percent(stock.buyThreshold, 1)} · {forecastSourceLabel(stock.dividendForecast.source)}</small>
               </div>
               <div className="stock-chart"><Sparkline values={stock.sparkline} positive={stock.changePct >= 0} /><span>%B {number(stock.percentB * 100, 0)}</span></div>
               <div className="stock-signals">

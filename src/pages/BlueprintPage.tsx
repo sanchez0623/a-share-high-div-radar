@@ -3,19 +3,21 @@ import { SectionHeading } from '../components/UI.tsx';
 
 const layers = [
   { index: '01', title: '数据接入层', subtitle: 'PROVIDER ADAPTER', text: '统一行情、财报、分红与公告的数据口径。当前使用显式演示适配器，未来可替换为 iFinD / Tushare，不污染领域逻辑。', icon: Database },
-  { index: '02', title: '指标与研究层', subtitle: 'RESEARCH ENGINE', text: '计算 MA20、布林带、%B、ATR 与预测股息率；五项信号独立判断，评分只用于研究排序。', icon: Workflow },
-  { index: '03', title: '决策编排层', subtitle: 'DECISION ORCHESTRATION', text: '按估值 → 超跌 → 趋势 → 风险 → 预算生成 L0–L3 研究等级；24 小时冷却只抑制重复提醒，不改变研究结论。', icon: GitBranch },
-  { index: '04', title: '人工复核层', subtitle: 'HUMAN-IN-THE-LOOP', text: '风险原文、分红假设与交易动作由人确认。系统不自动委托，不把高关注分包装成买入建议。', icon: ShieldCheck },
+  { index: '02', title: '指标与研究层', subtitle: 'RESEARCH ENGINE', text: '计算 MA20、布林带、%B、ATR 与预测股息率；六项信号独立判断，评分只用于研究排序。', icon: Workflow },
+  { index: '03', title: '决策编排层', subtitle: 'DECISION ORCHESTRATION', text: '按估值 → 分红质量 → 超跌 → 趋势 → 风险 → 预算生成 L0–L3 研究等级；质量不达标或含一次性分红时封顶 L1，风险按严重度矩阵阻断，24 小时冷却只抑制重复提醒。', icon: GitBranch },
+  { index: '04', title: '人工复核层', subtitle: 'HUMAN-IN-THE-LOOP', text: '风险原文、核验记录与有效期由人逐条登记；股票级闸门由全部风险事件派生，高风险未关闭时全部等级阻断。', icon: ShieldCheck },
 ];
 
 const endpoints = [
-  ['GET', '/api/dashboard', '观察仓、组合与风险总览'],
+  ['GET', '/api/dashboard', '观察仓、组合、风险总览与阻断矩阵'],
   ['GET', '/api/stocks/:symbol', '个股指标、历史与价格阶梯'],
   ['POST', '/api/stocks/:symbol/assumption', '保存分红假设并重算研究价格'],
   ['POST', '/api/stocks/:symbol/assumption/preview', '临时预览假设，不写回状态'],
-  ['PATCH', '/api/stocks/:symbol/settings', '更新收益率门槛与风险状态'],
+  ['PATCH', '/api/stocks/:symbol/settings', '更新收益率门槛（风险状态不可直写）'],
   ['POST', '/api/watchlist', '添加观察标的'],
-  ['POST', '/api/risk/:id/acknowledge', '记录人工风险复核'],
+  ['POST', '/api/risk/:id/verify', '逐条记录核验备注、证据与有效期'],
+  ['PATCH', '/api/risk/:id/source', '原文更新并使该条旧核验失效'],
+  ['POST', '/api/risk', '登记风险事项，高风险使既有核验失效'],
   ['POST', '/api/portfolio/trade', '校验并记录模拟交易'],
   ['GET', '/api/export/watchlist', '导出观察仓 CSV'],
 ];
@@ -54,8 +56,9 @@ export default function BlueprintPage() {
           <div className="domain-list">
             <div><strong>Stock</strong><span>行情 + 分红假设 + 五维信号</span><p>股息率只由 forecastDividend / price 推导。</p></div>
             <div><strong>DividendAssumption</strong><span>年度 + 情景 + 每股分红 + 要求股息率 + 版本</span><p>实验室、计划与交易共用同一版本，重启后从磁盘恢复。</p></div>
-            <div><strong>Signal</strong><span>估值 / 超跌 / 趋势 / 风险 / 预算</span><p>独立状态，不允许总分掩盖风险阻断。</p></div>
+            <div><strong>Signal</strong><span>估值 / 分红质量 / 超跌 / 趋势 / 风险 / 预算</span><p>独立状态，不允许总分掩盖风险阻断。</p></div>
             <div><strong>PlanTier</strong><span>门槛 + 研究价 + 条件 + 解锁状态</span><p>研究价 = 预测每股分红 ÷ 目标股息率。</p></div>
+            <div><strong>RiskEvent / RiskGate</strong><span>原文来源 + 严重度 + 核验记录 + 有效期</span><p>核验状态按当前时间派生，股票级闸门汇总全部风险事件。</p></div>
             <div><strong>Portfolio</strong><span>现金 + 持仓 + 预计现金流</span><p>交易校验整百股、现金与持仓约束。</p></div>
           </div>
         </div>

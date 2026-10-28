@@ -1,5 +1,10 @@
 import { ArrowLeft, ArrowRight, CheckCircle2, CircleDashed, ShieldAlert } from 'lucide-react';
 import type { StockDetailResponse, Stock } from '../../shared/types.ts';
+import {
+  dividendQualityLabel,
+  forecastSourceLabel,
+  statBasisLabel,
+} from '../../shared/assumptions.ts';
 import { DividendBars, PriceChart } from '../components/Charts.tsx';
 import { LevelBadge, SectionHeading, SignalPill } from '../components/UI.tsx';
 import { money, number, percent } from '../format.ts';
@@ -40,19 +45,19 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
 
       <section className="metric-strip">
         <div><span>最近收盘</span><strong>¥{number(stock.price)}</strong><small className={stock.changePct >= 0 ? 'up' : 'down'}>{stock.changePct >= 0 ? '+' : ''}{percent(stock.changePct)}</small></div>
-        <div><span>预测每股分红</span><strong>¥{number(stock.forecastDividend)}</strong><small>派息率 {percent(stock.payoutRatio, 0)}</small></div>
-        <div><span>布林位置</span><strong>%B {number(stock.percentB * 100, 0)}</strong><small>下轨 ¥{number(stock.bollLower)}</small></div>
+        <div><span>预测每股分红</span><strong>¥{number(stock.forecastDividend)}</strong><small>派息率 {percent(stock.payoutRatio, 0)} · 质量 {dividendQualityLabel(stock.dividendQuality.status)}</small></div>
+        <div><span>布林位置</span><strong>%B {number(stock.percentB * 100, 0)}</strong><small>下轨 ¥{number(stock.bollLower)} · 前复权</small></div>
         <div><span>ATR 波动</span><strong>¥{number(stock.atr)}</strong><small>MA20 ¥{number(stock.ma20)}</small></div>
-        <div><span>估值 / 盈利</span><strong>{number(stock.pe, 1)} PE</strong><small>ROE {percent(stock.roe, 1)}</small></div>
+        <div><span>估值 / 盈利</span><strong>{number(stock.pe, 1)} PE</strong><small>PE {statBasisLabel(stock.valuationBasis.pe)} · ROE {statBasisLabel(stock.valuationBasis.roe)} {percent(stock.roe, 1)}</small></div>
       </section>
 
       <section className="detail-analysis-grid">
         <div className="panel price-panel">
-          <SectionHeading eyebrow="PRICE STRUCTURE / 60D" title="价格结构" aside={<span className="snapshot-label">{stock.updatedAt} 快照</span>} />
+          <SectionHeading eyebrow="PRICE STRUCTURE / 60D" title="价格结构" aside={<span className="snapshot-label">{stock.marketData.quoteTime} 前复权快照</span>} />
           <PriceChart history={history} stock={stock} />
         </div>
         <aside className="panel signal-panel">
-          <SectionHeading eyebrow="FIVE GATES" title="五道独立闸门" />
+          <SectionHeading eyebrow="SIX GATES" title="六道独立闸门" />
           <div className="signal-list">
             {stock.signals.map((signal, index) => (
               <div className="signal-item" key={signal.key}>
@@ -64,7 +69,15 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
               </div>
             ))}
           </div>
-          {!stock.riskVerified && <div className="risk-reminder"><ShieldAlert size={17} /><span>风险未核验，任何量化等级都不能直接转化为委托。</span></div>}
+          {!stock.riskGate.verified && (
+            <div className={`risk-reminder ${stock.riskGate.highestOpenSeverity === 'high' ? 'blocking' : ''}`}>
+              <ShieldAlert size={17} />
+              <span>
+                {stock.riskGate.summary}；允许等级：
+                {stock.riskGate.allowedLevels.join(' / ') || '无（全部阻断）'}
+              </span>
+            </div>
+          )}
         </aside>
       </section>
 
@@ -72,6 +85,12 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
         <div className="panel dividend-history-panel">
           <SectionHeading eyebrow="DIVIDEND TRACK RECORD" title="分红连续性" aside={<span className="outline-tag">连续 {stock.dividendStreak} 年</span>} />
           <DividendBars dividends={dividends} />
+          <div className="forecast-trace">
+            <p><span>预测来源</span><strong>{forecastSourceLabel(stock.dividendForecast.source)}</strong></p>
+            <p><span>报告期</span><strong>{stock.dividendForecast.reportPeriod}</strong></p>
+            <p><span>公告日期</span><strong>{stock.dividendForecast.announcementDate ?? '无（非公告口径）'}</strong></p>
+            <p className="wide"><span>预测假设</span><strong>{stock.dividendForecast.hypothesis}</strong></p>
+          </div>
           <p className="panel-footnote">历史记录为演示口径；预测分红需结合最新财报、派息政策与现金流人工确认。</p>
         </div>
         <div className="panel next-step-panel">

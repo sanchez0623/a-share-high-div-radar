@@ -211,6 +211,44 @@ test('非法假设输入返回400且不覆盖已保存版本', async () => {
   assert.equal(detail.assumptionSaved, true);
 });
 
+test('连续读取 Dashboard 与详情时研究结论恒定，冷却不影响结论', async () => {
+  const isolated = await startServer();
+  const readRadar = async (): Promise<Stock> => {
+    const response = await fetch(`${isolated.baseUrl}/api/dashboard`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as DashboardResponse;
+    const stock = body.stocks.find((item) => item.symbol === '601318.SH');
+    assert.ok(stock);
+    return stock;
+  };
+  const readIsolatedDetail = async (): Promise<StockDetailResponse> => {
+    const response = await fetch(`${isolated.baseUrl}/api/stocks/601318.SH`);
+    assert.equal(response.status, 200);
+    return response.json() as Promise<StockDetailResponse>;
+  };
+
+  try {
+    const baseline = await readRadar();
+    const baselineDetail = await readIsolatedDetail();
+    assert.equal(baseline.level, 'L1');
+    assert.equal(baseline.action, '进入人工复核');
+
+    for (let index = 0; index < 3; index += 1) {
+      const radar = await readRadar();
+      const detail = await readIsolatedDetail();
+      assert.equal(radar.level, baseline.level);
+      assert.equal(radar.action, baseline.action);
+      assert.equal(radar.summary, baseline.summary);
+      assert.equal(detail.stock.level, radar.level);
+      assert.equal(detail.stock.action, radar.action);
+      assert.equal(detail.stock.summary, radar.summary);
+      assert.deepEqual(detail.plan, baselineDetail.plan);
+    }
+  } finally {
+    await new Promise<void>((resolve) => isolated.server.close(() => resolve()));
+  }
+});
+
 test('服务重启后已保存假设仍可恢复', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'dividend-assumption-'));
   const file = join(directory, 'assumptions.json');

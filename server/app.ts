@@ -15,12 +15,13 @@ import {
   DATA_NOTICE,
   TradeError,
   buildResearchPlan,
+  dispatchReminder,
   executeTrade,
   getPortfolio,
+  getStockSnapshot,
   hydrateAssumptions,
   parseAssumptionInput,
   previewAssumption,
-  refreshStock,
   resolveAssumption,
   saveAssumption,
   type DemoState,
@@ -79,7 +80,7 @@ export function createApp(
     const response: DashboardResponse = {
       asOf: AS_OF,
       dataMode: 'demo',
-      stocks: Array.from(state.watchlist, (symbol) => refreshStock(state, symbol)),
+      stocks: Array.from(state.watchlist, (symbol) => getStockSnapshot(state, symbol)),
       portfolio: getPortfolio(state),
       risks: state.risks,
       dataNotice: DATA_NOTICE,
@@ -99,7 +100,7 @@ export function createApp(
       return;
     }
 
-    res.json(buildDetail(refreshStock(state, symbol)));
+    res.json(buildDetail(getStockSnapshot(state, symbol)));
   });
 
   app.post('/api/stocks/:symbol/assumption', (req, res) => {
@@ -112,7 +113,9 @@ export function createApp(
     try {
       saveAssumption(state, symbol, parseAssumptionInput(req.body));
       persistAssumptions();
-      res.json(buildDetail(refreshStock(state, symbol)));
+      const stock = getStockSnapshot(state, symbol);
+      dispatchReminder(state, stock);
+      res.json(buildDetail(stock));
     } catch (error) {
       if (error instanceof AssumptionError) {
         res.status(400).json({ error: error.message });
@@ -183,7 +186,9 @@ export function createApp(
       });
       persistAssumptions();
     }
-    res.json(refreshStock(state, symbol));
+    const stock = getStockSnapshot(state, symbol);
+    dispatchReminder(state, stock);
+    res.json(stock);
   });
 
   app.post('/api/watchlist', (req, res) => {
@@ -221,7 +226,7 @@ export function createApp(
     const stock = state.stocks.get(risk.symbol);
     if (stock) {
       stock.riskVerified = true;
-      refreshStock(state, stock.symbol);
+      dispatchReminder(state, getStockSnapshot(state, stock.symbol));
     }
     res.json(risk);
   });
@@ -255,7 +260,7 @@ export function createApp(
       'holdingCost',
     ];
     const rows = Array.from(state.watchlist, (symbol) => {
-      const stock = state.stocks.get(symbol)!;
+      const stock = getStockSnapshot(state, symbol);
       return [
         stock.symbol,
         stock.name,

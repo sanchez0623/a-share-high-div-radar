@@ -8,10 +8,11 @@ import {
   calculateIndicators,
   createDemoState,
   deriveResearchLevel,
+  dispatchReminder,
   executeTrade,
+  getStockSnapshot,
   hydrateAssumptions,
   previewAssumption,
-  refreshStock,
   resolveAssumption,
   saveAssumption,
 } from './engine.ts';
@@ -169,16 +170,46 @@ test('交易拒绝非整百股、现金不足和持仓不足且失败不改状�
   assert.equal(state.holdings.get('600941.SH')!.shares, 100);
 });
 
-test('初始观察仓等级与冷却期符合演示设定', () => {
+test('初始观察仓研究结论符合演示设定，快照读取不写入冷却', () => {
   const state = createDemoState();
   assert.equal(state.histories.get('601318.SH')!.length, 90);
   assert.equal(state.stocks.get('601318.SH')!.level, 'L1');
   assert.equal(state.stocks.get('600941.SH')!.level, 'L0');
   assert.equal(state.stocks.get('000333.SZ')!.level, 'L0');
 
-  const first = refreshStock(state, '601318.SH', 1_000);
-  const second = refreshStock(state, '601318.SH', 2_000);
+  const first = getStockSnapshot(state, '601318.SH');
+  const second = getStockSnapshot(state, '601318.SH');
+  assert.equal(first.level, 'L1');
   assert.equal(first.action, '进入人工复核');
-  assert.equal(second.level, 'L1');
-  assert.equal(second.action, '继续观察');
+  assert.deepEqual(second, first);
+  assert.equal(state.lastNotices.size, 0);
+});
+
+test('冷却只抑制重复提醒，假设或风险变化时重新评估', () => {
+  const state = createDemoState();
+  const stock = getStockSnapshot(state, '601318.SH');
+
+  assert.equal(dispatchReminder(state, stock, 1_000).notify, true);
+  assert.equal(dispatchReminder(state, stock, 2_000).notify, false);
+  assert.equal(stock.level, 'L1');
+  assert.equal(stock.action, '进入人工复核');
+
+  saveAssumption(state, '601318.SH', {
+    forecastYear: 2026,
+    scenario: 'base',
+    requiredYield: 5.5,
+  });
+  const afterAssumption = getStockSnapshot(state, '601318.SH');
+  assert.equal(afterAssumption.assumptionVersion, 1);
+  assert.equal(dispatchReminder(state, afterAssumption, 3_000).notify, true);
+
+  state.stocks.get('601318.SH')!.riskVerified = true;
+  const afterRisk = getStockSnapshot(state, '601318.SH');
+  assert.equal(dispatchReminder(state, afterRisk, 4_000).notify, true);
+  assert.equal(afterRisk.action, '进入人工复核');
+
+  const l0State = createDemoState();
+  const l0Stock = getStockSnapshot(l0State, '600941.SH');
+  assert.equal(dispatchReminder(l0State, l0Stock, 1_000).notify, false);
+  assert.equal(l0State.lastNotices.size, 0);
 });

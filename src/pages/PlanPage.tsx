@@ -125,7 +125,7 @@ export default function PlanPage({
 
       <section className="cooldown-note">
         <div className="cooldown-number">24<span>h</span></div>
-        <div><span className="eyebrow">COOLING-OFF PERIOD</span><h3>同一等级，不重复催促。</h3><p>同一标的在同一研究等级触发后进入 24 小时冷却期。只有价格进入更深档位、分红假设变化或人工风险状态改变，才重新评估。</p></div>
+        <div><span className="eyebrow">COOLING-OFF PERIOD</span><h3>同一等级，不重复催促。</h3><p>同一标的在同一研究等级触发后进入 24 小时冷却期，只抑制重复提醒，不改变研究等级与动作。只有价格进入更深档位、分红假设变化或人工风险状态改变，才重新评估提醒。</p></div>
         <button className="button button-dark" onClick={onCreateChecklist}><ClipboardList size={16} />生成研究清单</button>
       </section>
       <p className="legal-note">L1 / L2 / L3 是研究等级，不是券商条件单，也不代表必须重复买入。所有操作均需人工确认。</p>

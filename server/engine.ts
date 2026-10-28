@@ -663,7 +663,7 @@ export function createDemoState(): DemoState {
         (seed) => [seed.symbol, { shares: 0, cost: 0, assumptionVersion: null }] as const,
       ),
     ]),
-    lastAdvices: new Map(),
+    lastNotices: new Map(),
   };
 
   for (const seed of STOCK_SEEDS) {
@@ -714,30 +714,71 @@ export function createDemoState(): DemoState {
   return state;
 }
 
-export function refreshStock(state: DemoState, symbol: string, now = Date.now()): Stock {
+/**
+ * 研究快照：只依据当前价格、分红假设与风险状态重新计算研究结论。
+ * 纯计算，不读写提醒冷却状态，因此任意次数的 GET 都返回同一结论。
+ */
+export function getStockSnapshot(state: DemoState, symbol: string): Stock {
   const current = state.stocks.get(symbol);
   const history = state.histories.get(symbol);
   if (!current || !history) throw new Error('未知股票代码');
+  return analyzeStock(current, history, state.cash);
+}
 
-  const analyzed = analyzeStock(current, history, state.cash);
-  if (analyzed.level === 'L0') {
-    state.lastAdvices.delete(symbol);
-  } else {
-    const previous = state.lastAdvices.get(symbol);
-    const inCooldown =
-      previous?.level === analyzed.level &&
-      now >= previous.at &&
-      now - previous.at < ADVICE_COOLDOWN_MS;
-    if (inCooldown) {
-      analyzed.action = '继续观察';
-      analyzed.summary = `${analyzed.level}研究信号处于24小时冷却期，暂不重复提示，等待价格或风险状态变化。`;
-    } else {
-      state.lastAdvices.set(symbol, { level: analyzed.level, at: now });
-    }
+/**
+ * 提醒资格：只回答“这次要不要发提醒”，不改变等级、动作与原因。
+ * 分红假设或风险状态变化时，视为新的提醒场景重新评估。
+ */
+export function evaluateReminder(
+  state: DemoState,
+  stock: Stock,
+  now = Date.now(),
+): ReminderDecision {
+  if (stock.level === 'L0') {
+    return { notify: false, reason: '当前为L0，不产生提醒' };
   }
 
-  state.stocks.set(symbol, analyzed);
-  return analyzed;
+  const previous = state.lastNotices.get(stock.symbol);
+  if (!previous) {
+    return { notify: true, reason: '首次触发该等级的研究提醒' };
+  }
+
+  const changed =
+    previous.level !== stock.level ||
+    previous.assumptionVersion !== stock.assumptionVersion ||
+    previous.riskVerified !== stock.riskVerified;
+  if (changed) {
+    return { notify: true, reason: '研究等级、分红假设或风险状态变化，重新评估提醒' };
+  }
+
+  if (now < previous.at || now - previous.at >= ADVICE_COOLDOWN_MS) {
+    return { notify: true, reason: '已超出24小时冷却期，重新发送提醒' };
+  }
+
+  return { notify: false, reason: '同一等级与假设处于24小时冷却期，仅抑制重复提醒' };
+}
+
+/** 状态变更事件（保存假设、更新门槛、人工核验）触发；GET 路由不得调用。 */
+export function dispatchReminder(
+  state: DemoState,
+  stock: Stock,
+  now = Date.now(),
+): ReminderDecision {
+  if (stock.level === 'L0') {
+    state.lastNotices.delete(stock.symbol);
+    return { notify: false, reason: '当前为L0，不产生提醒' };
+  }
+
+  const decision = evaluateReminder(state, stock, now);
+  if (decision.notify) {
+    state.lastNotices.set(stock.symbol, {
+      level: stock.level,
+      assumptionVersion: stock.assumptionVersion,
+      riskVerified: stock.riskVerified,
+      at: now,
+    });
+  }
+  return decision;
 }
 
 export function getPortfolio(state: DemoState): Portfolio {

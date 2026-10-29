@@ -69,8 +69,8 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
               </div>
             ))}
           </div>
-          {!stock.riskGate.verified && (
-            <div className={`risk-reminder ${stock.riskGate.highestOpenSeverity === 'high' ? 'blocking' : ''}`}>
+          {(stock.riskGate.status === 'blocked' || stock.riskGate.status === 'review') && (
+            <div className={`risk-reminder ${stock.riskGate.status === 'blocked' ? 'blocking' : ''}`}>
               <ShieldAlert size={17} />
               <span>
                 {stock.riskGate.summary}；允许等级：

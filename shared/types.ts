@@ -279,7 +279,13 @@ export interface TradeResearchSnapshot {
   /** 成交时的风险闸门摘要。 */
   riskGate: Pick<
     RiskGate,
-    'verified' | 'totalCount' | 'openCount' | 'highestOpenSeverity' | 'allowedLevels' | 'summary'
+    | 'status'
+    | 'verified'
+    | 'totalCount'
+    | 'openCount'
+    | 'highestOpenSeverity'
+    | 'allowedLevels'
+    | 'summary'
   >;
   /** 成交时该股票的全部风险事件（含核验状态与证据）。 */
   risks: TradeRiskSnapshot[];
@@ -371,6 +377,12 @@ export interface Portfolio {
   trades: TradeRecord[];
 }
 
+/** 交易写操作的统一返回：最新组合账本 + 按新现金与持仓重算的派生快照。 */
+export interface TradeResponse extends Portfolio {
+  /** 现金或持仓变化后重新派生的股票快照（观察仓 + 全部现有持仓）。 */
+  stocks: Stock[];
+}
+
 export type RiskType = '公告' | '财务' | '行业' | '数据';
 export type RiskSeverity = 'high' | 'medium' | 'low';
 /** 核验状态一律派生，不在存储中写入。 */
@@ -447,9 +459,14 @@ export interface RiskPolicy {
   note: string;
 }
 
+/** 股票级风险状态：由风险事件唯一派生，展示层不得依据单个布尔字段重新推断。 */
+export type RiskGateStatus = 'clear' | 'verified' | 'review' | 'blocked';
+
 /** 股票级风险闸门：由该股票全部风险事件派生，不可直接写入。 */
 export interface RiskGate {
-  /** 全部风险事件都有有效核验。 */
+  /** 唯一的股票级状态：未登记 / 全部有效 / 部分未关闭 / 高风险阻断。 */
+  status: RiskGateStatus;
+  /** 全部风险事件都有有效核验；未登记风险时为 false，此时放行口径见 status。 */
   verified: boolean;
   totalCount: number;
   openCount: number;
@@ -504,6 +521,8 @@ export interface DashboardResponse {
   asOf: string;
   dataMode: DataMode;
   stocks: Stock[];
+  /** 交易候选：观察仓 + 全部现有持仓，含已移出观察仓但仍持有的股票。 */
+  tradeStocks: Stock[];
   portfolio: Portfolio;
   risks: RiskEvent[];
   /** 风险有效期与严重度阻断矩阵。 */
@@ -537,6 +556,7 @@ export interface CatalogItem {
   inWatchlist: boolean;
 }
 
+/** 设置项契约：服务端只接受这里声明的字段，其余字段一律拒绝。 */
 export interface SettingsPatch {
   buyThreshold?: number;
 }

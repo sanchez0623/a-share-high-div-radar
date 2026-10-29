@@ -46,7 +46,7 @@ export default function BlueprintPage() {
             <div><span>src/</span><p>React 表现层</p></div>
             <ul><li><b>pages/</b> 雷达、个股、实验室、计划、风险、组合</li><li><b>components/Charts.tsx</b> 原生 SVG 数据可视化</li><li><b>components/UI.tsx</b> 弹窗、状态与通用语义组件</li><li><b>api.ts</b> 统一请求、错误解析与接口类型</li><li><b>App.tsx</b> 页面编排、数据生命周期与全局交互</li></ul>
             <div><span>server/</span><p>Express 应用层</p></div>
-            <ul><li><b>engine.ts</b> 指标、评分、计划、提醒冷却与交易约束</li><li><b>app.ts / index.ts</b> 路由、输入校验、错误边界与 CSV 导出</li><li><b>engine.test.ts</b> 核心公式与领域规则单元测试</li></ul>
+            <ul><li><b>research.ts / indicators.ts</b> 纯计算：指标、评分、等级与价格阶梯</li><li><b>snapshot.ts / state-change.ts</b> 快照读取与显式状态变更（写入后统一重算与提醒）</li><li><b>assumptions.ts / risk-*.ts / portfolio.ts</b> 假设、风险与组合账本写入</li><li><b>app.ts / index.ts</b> 路由、输入校验、错误边界与 CSV 导出</li><li><b>engine.test.ts</b> 核心公式与领域规则单元测试</li></ul>
             <div><span>shared/types.ts</span><p>前后端共享领域契约，避免字段口径漂移</p></div>
           </div>
         </div>

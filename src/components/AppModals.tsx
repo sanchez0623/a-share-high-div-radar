@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Check, Clipboard, Minus, Plus, Search } from 'lucide-react';
 import type {
   AssumptionPreviewResponse,
@@ -7,9 +7,10 @@ import type {
   Stock,
   StockDetailResponse,
   TaxBasis,
+  TradeResponse,
 } from '../../shared/types.ts';
 import { forecastSourceLabel, scenarioMeta } from '../../shared/assumptions.ts';
-import { estimateTradeFees } from '../../shared/costs.ts';
+import { MIN_TRADE_PRICE, PRICE_TICK, estimateTradeFees } from '../../shared/costs.ts';
 import { api } from '../api.ts';
 import { money, number, percent } from '../format.ts';
 import { LevelBadge, Modal } from './UI.tsx';
@@ -19,22 +20,28 @@ export function WatchlistModal({ onClose, onChanged }: { onClose: () => void; on
   const [query, setQuery] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
+  // 观察仓请求序列号：只接受最新一次请求的列表，避免乱序响应回滚观察仓状态。
+  const catalogSeq = useRef(0);
 
   useEffect(() => {
-    api.catalog().then(setCatalog).catch((reason: Error) => setError(reason.message));
+    const seq = ++catalogSeq.current;
+    api.catalog()
+      .then((result) => { if (seq === catalogSeq.current) setCatalog(result); })
+      .catch((reason: Error) => { if (seq === catalogSeq.current) setError(reason.message); });
   }, []);
 
   const toggle = async (item: CatalogItem) => {
+    const seq = ++catalogSeq.current;
     setBusy(item.symbol);
     setError('');
     try {
       const result = item.inWatchlist ? await api.removeWatchlist(item.symbol) : await api.addWatchlist(item.symbol);
-      setCatalog(result);
+      if (seq === catalogSeq.current) setCatalog(result);
       await onChanged();
     } catch (reason) {
-      setError((reason as Error).message);
+      if (seq === catalogSeq.current) setError((reason as Error).message);
     } finally {
-      setBusy(null);
+      if (seq === catalogSeq.current) setBusy(null);
     }
   };
 
@@ -59,7 +66,7 @@ export function WatchlistModal({ onClose, onChanged }: { onClose: () => void; on
   );
 }
 
-export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stocks: Stock[]; initialSymbol: string; onClose: () => void; onTraded: () => Promise<void> }) {
+export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stocks: Stock[]; initialSymbol: string; onClose: () => void; onTraded: (result: TradeResponse) => Promise<void> }) {
   const [symbol, setSymbol] = useState(initialSymbol);
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
   const [shares, setShares] = useState(100);
@@ -83,7 +90,7 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
     setBusy(true);
     setError('');
     try {
-      await api.trade({
+      const result = await api.trade({
         symbol,
         side,
         shares,
@@ -92,7 +99,7 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
         planLevel: planLevel || null,
         taxBasis,
       });
-      await onTraded();
+      await onTraded(result);
       onClose();
     } catch (reason) {
       setError((reason as Error).message);
@@ -108,7 +115,7 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
         <label className="field field-full"><span>公司</span><select value={symbol} onChange={(event) => setSymbol(event.target.value)}>{stocks.map((item) => <option key={item.symbol} value={item.symbol}>{item.name} · {item.symbol}</option>)}</select></label>
         <div className="field field-full"><span>方向</span><div className="side-tabs"><button className={side === 'buy' ? 'active' : ''} onClick={() => setSide('buy')}>模拟买入</button><button className={side === 'sell' ? 'active' : ''} onClick={() => setSide('sell')}>模拟卖出</button></div></div>
         <label className="field"><span>股数（100 股整数倍）</span><input type="number" min="100" step="100" value={shares} onChange={(event) => setShares(Number(event.target.value))} /></label>
-        <label className="field"><span>成交价格（元）</span><input type="number" min="0.01" step="0.01" value={price} onChange={(event) => setPrice(Number(event.target.value))} /></label>
+        <label className="field"><span>成交价格（元）</span><input type="number" min={MIN_TRADE_PRICE} step={PRICE_TICK} value={price} onChange={(event) => setPrice(Number(event.target.value))} /></label>
         <label className="field"><span>成交日期</span><input type="date" value={executedAt} onChange={(event) => setExecutedAt(event.target.value)} /></label>
         <label className="field"><span>计划档位（可选）</span><select value={planLevel} onChange={(event) => setPlanLevel(event.target.value as Exclude<ResearchLevel, 'L0'> | '')}><option value="">无计划 · 人工记录</option><option value="L1">L1 第一档</option><option value="L2">L2 第二档</option><option value="L3">L3 第三档</option></select></label>
         <div className="field field-full"><span>记账口径</span><div className="side-tabs"><button className={taxBasis === 'pre_tax' ? 'active' : ''} onClick={() => setTaxBasis('pre_tax')}>税前</button><button className={taxBasis === 'after_tax' ? 'active' : ''} onClick={() => setTaxBasis('after_tax')}>税后</button></div></div>
@@ -130,7 +137,7 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
         {planLevel && <span>档位 {planLevel}</span>}
       </div>
       {error && <p className="form-error">{error}</p>}
-      <div className="modal-footer"><button className="button button-ghost" onClick={onClose}>取消</button><button className="button button-dark" disabled={busy || shares <= 0 || price <= 0} onClick={submit}>{busy ? '正在校验…' : '确认记录'}</button></div>
+      <div className="modal-footer"><button className="button button-ghost" onClick={onClose}>取消</button><button className="button button-dark" disabled={busy || shares <= 0 || price < MIN_TRADE_PRICE} onClick={submit}>{busy ? '正在校验…' : '确认记录'}</button></div>
     </Modal>
   );
 }

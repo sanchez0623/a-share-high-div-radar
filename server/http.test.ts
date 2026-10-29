@@ -12,13 +12,14 @@ import type {
   Stock,
   StockDetailResponse,
   TradeReviewResponse,
+  TradeResponse,
 } from '../shared/types.ts';
 import { researchPrice } from '../shared/assumptions.ts';
-import { createApp } from './app.ts';
+import { createApp, type AppOptions } from './app.ts';
 import { createFileAssumptionStore } from './assumption-store.ts';
 import { createFileRiskStore } from './risk-store.ts';
 import { createFilePortfolioStore } from './portfolio-store.ts';
-import { createDemoState } from './engine.ts';
+import { createDemoState } from './demo-data.ts';
 
 let server: Server;
 let baseUrl = '';
@@ -98,8 +99,9 @@ async function startServer(
   store?: ReturnType<typeof createFileAssumptionStore>,
   riskStore?: ReturnType<typeof createFileRiskStore>,
   portfolioStore?: ReturnType<typeof createFilePortfolioStore>,
+  options?: AppOptions,
 ) {
-  const app = createApp(createDemoState(), store, riskStore, portfolioStore);
+  const app = createApp(createDemoState(), store, riskStore, portfolioStore, options);
   const server = app.listen(0);
   await new Promise<void>((resolve, reject) => {
     server.once('listening', resolve);
@@ -136,6 +138,44 @@ test('越界门槛返回400且不覆盖已保存值', async () => {
 
   const detail = await readDetail('601318.SH');
   assert.equal(detail.stock.buyThreshold, 6.2);
+});
+
+test('设置接口拒绝白名单外字段，批量赋值无法改动代码、预测分红与持仓', async () => {
+  const before = await readDetail('601318.SH');
+  const response = await patchSettings('601318.SH', {
+    symbol: '000001.SZ',
+    name: '被篡改',
+    forecastDividend: 99,
+    dividendYield: 99,
+    holdingShares: 999999,
+    holdingCost: 0.01,
+    riskGate: { verified: true },
+  });
+  assert.equal(response.status, 400);
+  assert.match(((await response.json()) as { error?: string }).error ?? '', /symbol/);
+
+  const after = await readDetail('601318.SH');
+  assert.equal(after.stock.symbol, '601318.SH');
+  assert.equal(after.stock.name, before.stock.name);
+  assert.equal(after.stock.forecastDividend, before.stock.forecastDividend);
+  assert.equal(after.stock.dividendYield, before.stock.dividendYield);
+  assert.equal(after.stock.holdingShares, before.stock.holdingShares);
+  assert.equal(after.stock.holdingCost, before.stock.holdingCost);
+  assert.equal(after.stock.riskGate.verified, before.stock.riskGate.verified);
+});
+
+test('设置接口要求至少一个可写字段，且数值必须合法', async () => {
+  const empty = await patchSettings('600941.SH', {});
+  assert.equal(empty.status, 400);
+  assert.match(((await empty.json()) as { error?: string }).error ?? '', /设置项/);
+
+  const stringValue = await patchSettings('600941.SH', { buyThreshold: '6' });
+  assert.equal(stringValue.status, 400);
+  assert.match(((await stringValue.json()) as { error?: string }).error ?? '', /buyThreshold/);
+
+  const arrayBody = await patchSettings('600941.SH', []);
+  assert.equal(arrayBody.status, 400);
+  assert.match(((await arrayBody.json()) as { error?: string }).error ?? '', /JSON对象/);
 });
 
 test('风险状态由事件派生，PATCH 直写会被拒绝', async () => {
@@ -182,6 +222,7 @@ test('单条核验只关闭自身；新增高风险后等级与动作按公开�
   assert.equal(verified.risk.status, 'verified');
   assert.equal(verified.risk.verification?.verifiedBy, '研究台用户');
   assert.equal(verified.stock.riskGate.verified, true);
+  assert.equal(verified.stock.riskGate.status, 'verified');
   assert.deepEqual(verified.stock.riskGate.allowedLevels, ['L1', 'L2', 'L3']);
 
   const addedResponse = await postRisk({
@@ -200,6 +241,7 @@ test('单条核验只关闭自身；新增高风险后等级与动作按公开�
   const added = (await addedResponse.json()) as RiskMutationResponse;
   assert.equal(added.risk.status, 'pending');
   assert.equal(added.stock.riskGate.highestOpenSeverity, 'high');
+  assert.equal(added.stock.riskGate.status, 'blocked');
   assert.deepEqual(added.stock.riskGate.allowedLevels, []);
   assert.equal(added.stock.level, 'L0');
   assert.equal(added.stock.action, '风险阻断');
@@ -253,6 +295,10 @@ test('单条核验只关闭自身；新增高风险后等级与动作按公开�
     assert.ok((risk.verification?.evidenceUrl?.length ?? 0) >= 4);
     assert.ok((risk.verification?.note.length ?? 0) >= 4);
   }
+  /** 风险页逐条状态与股票级闸门同源：全部核验后必然同时是 verified。 */
+  const gateStock = finalDashboard.stocks.find((stock) => stock.symbol === '601318.SH');
+  assert.equal(gateStock?.riskGate.status, 'verified');
+  assert.equal(gateStock?.riskGate.openCount, 0);
 });
 
 test('原文更新使该条核验失效并恢复阻断', async () => {
@@ -271,8 +317,44 @@ test('原文更新使该条核验失效并恢复阻断', async () => {
   assert.equal(body.risk.status, 'invalidated');
   assert.match(body.risk.statusReason, /原文更新/);
   assert.equal(body.stock.riskGate.highestOpenSeverity, 'high');
+  assert.equal(body.stock.riskGate.status, 'blocked');
   assert.deepEqual(body.stock.riskGate.allowedLevels, []);
   assert.equal(body.stock.action, '风险阻断');
+});
+
+test('雷达股票级风险状态与风险页逐条状态完全同源', async () => {
+  const dashboard = (await (await fetch(`${baseUrl}/api/dashboard`)).json()) as DashboardResponse;
+
+  for (const stock of dashboard.stocks) {
+    const risks = dashboard.risks.filter((risk) => risk.symbol === stock.symbol);
+    const open = risks.filter((risk) => risk.status !== 'verified');
+    const expected =
+      risks.length === 0
+        ? 'clear'
+        : open.length === 0
+          ? 'verified'
+          : open.some((risk) => risk.severity === 'high')
+            ? 'blocked'
+            : 'review';
+    const allowed =
+      expected === 'blocked' ? [] : expected === 'review' ? ['L1', 'L2'] : ['L1', 'L2', 'L3'];
+
+    /** 股票级闸门只由风险事件派生：数量、状态与放行等级逐项对齐风险页。 */
+    assert.equal(stock.riskGate.totalCount, risks.length, stock.symbol);
+    assert.equal(stock.riskGate.openCount, open.length, stock.symbol);
+    assert.equal(stock.riskGate.status, expected, stock.symbol);
+    assert.deepEqual(stock.riskGate.allowedLevels, allowed, stock.symbol);
+    /** 已解锁的等级不会被风险页的逐条状态推翻。 */
+    const riskSignal = stock.signals.find((signal) => signal.key === 'risk');
+    assert.ok(riskSignal, stock.symbol);
+    if (expected === 'verified') {
+      assert.equal(riskSignal.status, 'pass', stock.symbol);
+      assert.match(riskSignal.value, /有效核验/, stock.symbol);
+    }
+    if (expected === 'blocked') {
+      assert.equal(riskSignal.status, 'block', stock.symbol);
+    }
+  }
 });
 
 test('风险核验记录与原文版本随服务重启恢复', async () => {
@@ -314,6 +396,167 @@ test('风险核验记录与原文版本随服务重启恢复', async () => {
     if (first) await new Promise<void>((resolve) => first!.server.close(() => resolve()));
     if (second) await new Promise<void>((resolve) => second!.server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('默认拒绝非本机来源，回环来源按原样放行', async () => {
+  const denied = await fetch(`${baseUrl}/api/dashboard`, {
+    headers: { Origin: 'https://evil.example' },
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('access-control-allow-origin'), null);
+
+  /** 预检同样不放行：浏览器拿不到任何 CORS 头，写接口无法被跨站调用。 */
+  const preflight = await fetch(`${baseUrl}/api/portfolio/trade`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://evil.example',
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'content-type',
+    },
+  });
+  assert.equal(preflight.status, 403);
+
+  const allowed = await fetch(`${baseUrl}/api/dashboard`, {
+    headers: { Origin: 'http://localhost:5173' },
+  });
+  assert.equal(allowed.status, 200);
+  assert.equal(allowed.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+  assert.equal(allowed.headers.get('x-powered-by'), null);
+});
+
+test('显式白名单来源可访问，白名单外的来源仍被拒绝', async () => {
+  const isolated = await startServer(undefined, undefined, undefined, {
+    allowedOrigins: ['https://radar.example.com'],
+  });
+  try {
+    const allowed = await fetch(`${isolated.baseUrl}/api/dashboard`, {
+      headers: { Origin: 'https://radar.example.com' },
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get('access-control-allow-origin'), 'https://radar.example.com');
+
+    const denied = await fetch(`${isolated.baseUrl}/api/dashboard`, {
+      headers: { Origin: 'https://other.example.com' },
+    });
+    assert.equal(denied.status, 403);
+  } finally {
+    await new Promise<void>((resolve) => isolated.server.close(() => resolve()));
+  }
+});
+
+test('配置访问令牌后读接口与写接口都必须带令牌', async () => {
+  const guarded = await startServer(undefined, undefined, undefined, {
+    accessToken: 's3cret-token',
+  });
+  try {
+    const anonymous = await fetch(`${guarded.baseUrl}/api/dashboard`);
+    assert.equal(anonymous.status, 401);
+
+    const wrong = await fetch(`${guarded.baseUrl}/api/watchlist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer nope' },
+      body: JSON.stringify({ symbol: '601318.SH' }),
+    });
+    assert.equal(wrong.status, 401);
+
+    const bearer = await fetch(`${guarded.baseUrl}/api/dashboard`, {
+      headers: { Authorization: 'Bearer s3cret-token' },
+    });
+    assert.equal(bearer.status, 200);
+
+    const headerToken = await fetch(`${guarded.baseUrl}/api/dashboard`, {
+      headers: { 'X-Access-Token': 's3cret-token' },
+    });
+    assert.equal(headerToken.status, 200);
+
+    const exportAnonymous = await fetch(`${guarded.baseUrl}/api/export/watchlist`);
+    assert.equal(exportAnonymous.status, 401);
+  } finally {
+    await new Promise<void>((resolve) => guarded.server.close(() => resolve()));
+  }
+});
+
+test('卖出候选包含全部现有持仓，移出观察仓后仍可卖出', async () => {
+  const isolated = await startServer();
+  try {
+    const buyResponse = await fetch(`${isolated.baseUrl}/api/portfolio/trade`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '000333.SZ', side: 'buy', shares: 100, price: 70 }),
+    });
+    assert.equal(buyResponse.status, 200);
+    const bought = (await buyResponse.json()) as TradeResponse;
+    /** 交易响应携带重算后的快照，持仓字段随成交同步。 */
+    assert.equal(
+      bought.stocks.find((stock) => stock.symbol === '000333.SZ')?.holdingShares,
+      100,
+    );
+
+    const removeResponse = await fetch(`${isolated.baseUrl}/api/watchlist/000333.SZ`, {
+      method: 'DELETE',
+    });
+    assert.equal(removeResponse.status, 200);
+
+    const dashboard = (await (
+      await fetch(`${isolated.baseUrl}/api/dashboard`)
+    ).json()) as DashboardResponse;
+    assert.ok(dashboard.stocks.every((stock) => stock.symbol !== '000333.SZ'));
+    const candidate = dashboard.tradeStocks.find((stock) => stock.symbol === '000333.SZ');
+    assert.ok(candidate, '移出观察仓的持仓仍必须出现在交易候选里');
+    assert.equal(candidate.holdingShares, 100);
+
+    const sellResponse = await fetch(`${isolated.baseUrl}/api/portfolio/trade`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '000333.SZ', side: 'sell', shares: 100, price: 70 }),
+    });
+    assert.equal(sellResponse.status, 200);
+    const sold = (await sellResponse.json()) as TradeResponse;
+    assert.equal(sold.positions.some((position) => position.symbol === '000333.SZ'), false);
+    assert.equal(sold.trades[0].side, 'sell');
+    assert.equal(
+      sold.stocks.find((stock) => stock.symbol === '000333.SZ')?.holdingShares ?? 0,
+      0,
+    );
+  } finally {
+    await new Promise<void>((resolve) => isolated.server.close(() => resolve()));
+  }
+});
+
+test('交易接口拒绝非法价格，导出CSV禁用缓存且按最新账本重算', async () => {
+  const isolated = await startServer();
+  try {
+    const rejected = await fetch(`${isolated.baseUrl}/api/portfolio/trade`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '601318.SH', side: 'sell', shares: 100, price: 0.001 }),
+    });
+    assert.equal(rejected.status, 400);
+    const body = (await rejected.json()) as { error?: string };
+    assert.match(body.error ?? '', /0\.01/);
+
+    const before = await fetch(`${isolated.baseUrl}/api/export/watchlist`);
+    assert.equal(before.status, 200);
+    assert.equal(before.headers.get('cache-control'), 'no-store');
+    await before.text();
+
+    const sellResponse = await fetch(`${isolated.baseUrl}/api/portfolio/trade`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '601318.SH', side: 'sell', shares: 100, price: 48.6 }),
+    });
+    assert.equal(sellResponse.status, 200);
+
+    const after = await fetch(`${isolated.baseUrl}/api/export/watchlist`);
+    assert.equal(after.headers.get('cache-control'), 'no-store');
+    const rows = (await after.text()).split('\r\n');
+    const header = rows[0].replaceAll('"', '').split(',');
+    const sharesIndex = header.indexOf('holdingShares');
+    const row = rows.find((line) => line.includes('601318.SH'))!;
+    assert.equal(row.replaceAll('"', '').split(',')[sharesIndex], '1900');
+  } finally {
+    await new Promise<void>((resolve) => isolated.server.close(() => resolve()));
   }
 });
 

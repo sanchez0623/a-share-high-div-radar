@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowRight, Check, ClipboardList, LockKeyhole, ShieldAlert, ShieldCheck } from 'lucide-react';
 import type {
   AssumptionPreviewResponse,
@@ -46,9 +46,12 @@ export default function PlanPage({
   const plan = draft?.plan ?? detail.plan;
   const totalReference = plan.reduce((sum, tier) => sum + tier.estimatedAmount, 0);
   const investable = detail.allocation.investableCash;
+  // 预算重算的请求序列号：只接受最新一次分配计算的结果。
+  const allocateSeq = useRef(0);
 
   // 切换标的或假设变化时，重置预算与分配为服务端默认（真实可投入现金）。
   useEffect(() => {
+    allocateSeq.current += 1;
     setBudget(detail.allocation.investableCash);
     setAllocation(detail.allocation);
     setError('');
@@ -58,14 +61,25 @@ export default function PlanPage({
   useEffect(() => {
     if (Math.abs(budget - investable) < 0.5) return;
     const timer = setTimeout(() => {
+      const seq = ++allocateSeq.current;
       setAllocating(true);
       api
         .stockWithBudget(stock.symbol, budget)
-        .then((result) => setAllocation(result.allocation))
-        .catch((reason: Error) => setError(reason.message))
-        .finally(() => setAllocating(false));
+        .then((result) => {
+          if (seq !== allocateSeq.current) return;
+          setAllocation(result.allocation);
+        })
+        .catch((reason: Error) => {
+          if (seq === allocateSeq.current) setError(reason.message);
+        })
+        .finally(() => {
+          if (seq === allocateSeq.current) setAllocating(false);
+        });
     }, 300);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      allocateSeq.current += 1;
+    };
   }, [budget, stock.symbol, investable]);
 
   const savePreview = async () => {

@@ -532,6 +532,7 @@ table { width: 100%; border-collapse: collapse; }
 .risk-gate-row span { color: #7d8b83; font-family: var(--mono); }
 .risk-gate-row em { padding: 2px 6px; border-radius: 3px; font-size: 8px; font-style: normal; }
 .risk-gate-row em.gate-verified { color: #557447; background: #eaf2df; }
+.risk-gate-row em.gate-clear { color: #6f7a73; background: #e7e9e1; }
 .risk-gate-row em.gate-review { color: #967042; background: #f5eddd; }
 .risk-gate-row em.gate-blocked { color: #a95742; background: var(--coral-soft); }
 .risk-policy-note { margin-top: 14px; color: #8a958e; font-size: 9px; line-height: 1.7; }

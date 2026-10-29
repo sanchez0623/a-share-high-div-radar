@@ -4,28 +4,23 @@ import type { PlanTier, PriceBar, ResearchLevel } from '../shared/types.ts';
 import { adjustForExDividend, researchPrice } from '../shared/assumptions.ts';
 import { buildPlanAllocation } from '../shared/allocation.ts';
 import {
-  RISK_POLICY,
-  TradeError,
-  addRiskEvent,
-  buildResearchPlan,
-  calculateIndicators,
-  createDemoState,
-  deriveResearchLevel,
-  deriveRiskEvent,
-  deriveRiskGate,
-  dispatchReminder,
-  executeTrade,
-  getPortfolio,
-  getStockSnapshot,
   hydrateAssumptions,
-  hydratePortfolio,
   previewAssumption,
   resolveAssumption,
-  reviewTrades,
   saveAssumption,
-  updateRiskSource,
-  verifyRisk,
-} from './engine.ts';
+} from './assumptions.ts';
+import { createDemoState } from './demo-data.ts';
+import { TradeError } from './errors.ts';
+import { calculateIndicators } from './indicators.ts';
+import { executeTrade, getPortfolio, hydratePortfolio } from './portfolio.ts';
+import { dispatchReminder } from './reminder.ts';
+import { buildResearchPlan, deriveResearchLevel, SIGNAL_WEIGHTS, analyzeStock } from './research.ts';
+import { round } from './numeric.ts';
+import { RISK_POLICY, deriveRiskEvent, deriveRiskGate } from './risk-model.ts';
+import { addRiskEvent, updateRiskSource, verifyRisk } from './risk-actions.ts';
+import { getStockSnapshot } from './snapshot.ts';
+import { commitPortfolioChange } from './state-change.ts';
+import { reviewTrades } from './trade-review.ts';
 
 const ALLOW_ALL = { allowedLevels: ['L1', 'L2', 'L3'] as ResearchLevel[] };
 const ALLOW_L1_L2 = { allowedLevels: ['L1', 'L2'] as ResearchLevel[] };
@@ -44,14 +39,66 @@ function fixtureHistory(): PriceBar[] {
   });
 }
 
-test('布林20日与ATR14使用确定口径计算', () => {
+test('布林20日与ATR14使用确定口径计算，指标保留未舍入值', () => {
   const result = calculateIndicators(fixtureHistory());
   assert.equal(result.ma20, 11);
   assert.equal(result.bollMiddle, 11);
   assert.equal(result.bollUpper, 13);
   assert.equal(result.bollLower, 9);
   assert.equal(result.percentB, 0.75);
-  assert.equal(result.atr, 2.07);
+  /** ATR 不做内部舍入：真实波幅合计 29，除以 14。 */
+  assert.equal(result.atr, 29 / 14);
+});
+
+test('门槛附近的股息率按未舍入值分级，展示值才四舍五入', () => {
+  const state = createDemoState();
+  const stock = state.stocks.get('601318.SH')!;
+  const history = state.histories.get('601318.SH')!.map((bar) => ({ ...bar }));
+  /** 近20日横盘且最后一日略低，%B 低于 L1 的 0.2 技术门槛。 */
+  for (let index = history.length - 20; index < history.length; index += 1) {
+    const close = index === history.length - 1 ? 49.9 : 50;
+    history[index] = { ...history[index], open: close, high: close, low: close, close };
+  }
+  const riskGate = deriveRiskGate(state.risks, '601318.SH');
+  const analyze = (forecastDividend: number) =>
+    analyzeStock({
+      stock: { ...stock, forecastDividend, buyThreshold: 5.5 },
+      history,
+      availableCash: state.cash,
+      riskGate,
+      holding: { shares: 0, cost: 0 },
+    });
+
+  /** 原始股息率 2.7425 / 49.9 ≈ 5.496%，展示四舍五入为 5.50%，实际未达 5.5% 门槛。 */
+  const below = analyze(2.7425);
+  assert.equal(below.dividendYield, 5.5);
+  assert.equal(below.level, 'L0');
+  assert.equal(below.signals.find((signal) => signal.key === 'valuation')!.status, 'watch');
+  assert.equal(below.action, '等待更深价格');
+
+  /** 原始股息率 2.745 / 49.9 ≈ 5.501%，展示同样是 5.50%，但内部值已达标。 */
+  const above = analyze(2.745);
+  assert.equal(above.dividendYield, 5.5);
+  assert.equal(above.level, 'L1');
+  assert.equal(above.signals.find((signal) => signal.key === 'valuation')!.status, 'pass');
+});
+
+test('评分按SignalKey绑定权重，权重合计100且不依赖信号数组下标', () => {
+  assert.equal(
+    Object.values(SIGNAL_WEIGHTS).reduce((total, weight) => total + weight, 0),
+    100,
+  );
+  const stock = getStockSnapshot(createDemoState(), '601318.SH');
+  assert.equal(
+    new Set(stock.signals.map((signal) => signal.key)).size,
+    Object.keys(SIGNAL_WEIGHTS).length,
+  );
+  const factors = { pass: 1, watch: 0.6, neutral: 0.3, block: 0 };
+  const expected = Object.entries(SIGNAL_WEIGHTS).reduce((total, [key, weight]) => {
+    const signal = stock.signals.find((item) => item.key === key)!;
+    return total + weight * factors[signal.status];
+  }, 0);
+  assert.equal(stock.score, round(expected));
 });
 
 test('研究价严格由预测股息除以各档收益率门槛推导', () => {
@@ -186,6 +233,38 @@ test('交易拒绝非整百股、现金不足和持仓不足且失败不改状�
   assert.equal(state.holdings.get('600941.SH')!.shares, 100);
 });
 
+test('交易校验最小价格、价格步长与舍入后成交金额，失败不改账本', () => {
+  const state = createDemoState();
+  /** 低于最小报价单位、非0.01整数倍以及非有限数都必须拒绝。 */
+  for (const price of [0.001, 0.005, 10.005, 20.999, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => executeTrade(state, { symbol: '601318.SH', side: 'sell', shares: 100, price }),
+      TradeError,
+    );
+  }
+  assert.equal(state.cash, 50_000);
+  assert.equal(state.holdings.get('601318.SH')!.shares, 2_000);
+  assert.equal(state.trades.length, 0);
+});
+
+test('现金或持仓变化后统一重算派生快照，资金信号与评分同步', () => {
+  const state = createDemoState();
+  /** 现金降到L1参考金额的一半以下，资金信号应先降级。 */
+  state.cash = 1_000;
+  const before = commitPortfolioChange(state).stocks.find(
+    (stock) => stock.symbol === '601318.SH',
+  )!;
+  assert.equal(before.signals.find((signal) => signal.key === 'budget')!.status, 'neutral');
+
+  executeTrade(state, { symbol: '601318.SH', side: 'sell', shares: 100, price: 48.6 });
+  const after = commitPortfolioChange(state);
+  const refreshed = after.stocks.find((stock) => stock.symbol === '601318.SH')!;
+  assert.equal(refreshed.signals.find((signal) => signal.key === 'budget')!.status, 'pass');
+  assert.equal(refreshed.holdingShares, 1_900);
+  assert.ok(refreshed.score > before.score, '现金回补后评分必须按新账本重算');
+  assert.equal(after.portfolio.cash, state.cash);
+});
+
 test('分配累计扣减同一笔预算，三档合计不超预算且含费不超剩余', () => {
   const plan: PlanTier[] = [
     { level: 'L1', name: '初步研究', targetPrice: 100, shares: 100, yieldThreshold: 0.06, estimatedAmount: 10_000, conditions: [], unlocked: true, assumptionVersion: 1 },
@@ -311,11 +390,14 @@ test('初始观察仓研究结论符合演示设定，快照读取不写入冷�
   assert.equal(state.stocks.get('600941.SH')!.level, 'L0');
   assert.equal(state.stocks.get('000333.SZ')!.level, 'L0');
 
+  const cached = structuredClone(state.stocks.get('601318.SH')!);
   const first = getStockSnapshot(state, '601318.SH');
   const second = getStockSnapshot(state, '601318.SH');
   assert.equal(first.level, 'L1');
   assert.equal(first.action, '进入人工复核');
   assert.deepEqual(second, first);
+  /** 读取路径既不改研究口径缓存，也不写入提醒冷却。 */
+  assert.deepEqual(state.stocks.get('601318.SH'), cached);
   assert.equal(state.lastNotices.size, 0);
 });
 
@@ -345,6 +427,7 @@ test('冷却只抑制重复提醒，假设或风险变化时重新评估', () =>
   );
   const afterRisk = getStockSnapshot(state, '601318.SH', 3_500);
   assert.equal(afterRisk.riskGate.verified, true);
+  assert.equal(afterRisk.riskGate.status, 'verified');
   assert.equal(dispatchReminder(state, afterRisk, 4_000).notify, true);
   assert.equal(afterRisk.action, '进入人工复核');
 
@@ -702,6 +785,75 @@ test('原文更新只作废本条核验，其他风险保持有效', () => {
   assert.equal(deriveRiskEvent(other, now + 1_000).status, 'verified');
 });
 
+test('股票级风险状态只由风险事件派生，未登记时不伪造待核验也不阻断', () => {
+  const now = Date.parse('2026-10-20T00:00:00.000Z');
+  const state = createDemoState(now);
+  const symbol = '601318.SH';
+  state.risks = state.risks.filter((item) => item.symbol !== symbol);
+
+  /** 未登记风险：状态为 clear，放行全部等级，页面不得再显示“L3 阻断”。 */
+  const clear = deriveRiskGate(state.risks, symbol, now);
+  assert.equal(clear.status, 'clear');
+  assert.equal(clear.openCount, 0);
+  assert.equal(clear.verified, false);
+  assert.deepEqual(clear.allowedLevels, ['L1', 'L2', 'L3']);
+
+  /** 登记中风险：状态降为 review，且等级随股票级状态一起收窄。 */
+  const added = addRiskEvent(
+    state,
+    {
+      symbol,
+      title: '演示：中风险事项',
+      type: '财务',
+      severity: 'medium',
+      summary: '演示：中风险未核验时只阻断L3。',
+      source: {
+        publisher: '演示公告库',
+        excerpt: '演示原文摘录：中风险事项。',
+        publishedAt: '2026-10-20',
+      },
+    },
+    now,
+  );
+  const review = deriveRiskGate(state.risks, symbol, now);
+  assert.equal(review.status, 'review');
+  assert.deepEqual(review.allowedLevels, ['L1', 'L2']);
+  assert.equal(getStockSnapshot(state, symbol, now).riskGate.status, 'review');
+
+  /** 完成核验：状态、等级与研究分级同源更新，不存在“已解锁但仍待核验”。 */
+  verifyRisk(
+    state,
+    added.id,
+    { note: '已核对演示原文与派息口径', evidenceUrl: 'https://example.com/demo/notice' },
+    now,
+  );
+  const verified = deriveRiskGate(state.risks, symbol, now);
+  assert.equal(verified.status, 'verified');
+  assert.deepEqual(verified.allowedLevels, ['L1', 'L2', 'L3']);
+  assert.equal(getStockSnapshot(state, symbol, now).riskGate.status, 'verified');
+
+  /** 新增高风险：状态立刻回到 blocked，旧核验一并失效。 */
+  addRiskEvent(
+    state,
+    {
+      symbol,
+      title: '演示：高风险事项',
+      type: '公告',
+      severity: 'high',
+      summary: '演示：高风险登记后全部等级阻断。',
+      source: {
+        publisher: '演示公告库',
+        excerpt: '演示原文摘录：高风险事项。',
+        publishedAt: '2026-10-21',
+      },
+    },
+    now + 1_000,
+  );
+  const blocked = deriveRiskGate(state.risks, symbol, now + 1_000);
+  assert.equal(blocked.status, 'blocked');
+  assert.deepEqual(blocked.allowedLevels, []);
+});
+
 test('executeTrade 捕获成交时的研究快照：假设、等级、风险与计划档位', () => {
   const state = createDemoState();
   saveAssumption(state, '601318.SH', {
@@ -731,6 +883,8 @@ test('executeTrade 捕获成交时的研究快照：假设、等级、风险与�
   assert.equal(context.plan[0].level, 'L1');
   assert.ok(Array.isArray(context.risks), '快照应包含成交时的逐条风险');
   assert.ok(context.risks.every((risk) => typeof risk.status === 'string'));
+  /** 快照冻结的是同一事实源的股票级状态，复盘不再二次推断。 */
+  assert.equal(context.riskGate.status, getStockSnapshot(state, '601318.SH').riskGate.status);
   assert.equal(trade.planLevel, 'L1');
   assert.ok(trade.planTargetPrice !== null);
 });
@@ -845,7 +999,7 @@ test('reviewTrades 标记未按规则执行与未平仓、无计划、无快照'
   );
 });
 
-test('hydratePortfolio 恢复观察仓、现金、持仓与交易账本并同步股票字段', () => {
+test('hydratePortfolio 恢复观察仓、现金、持仓与交易账本，快照读取时叠加持仓', () => {
   const state = createDemoState();
   executeTrade(state, { symbol: '601318.SH', side: 'buy', shares: 100, price: 40 });
   executeTrade(state, { symbol: '600941.SH', side: 'buy', shares: 200, price: 50 });
@@ -870,22 +1024,24 @@ test('hydratePortfolio 恢复观察仓、现金、持仓与交易账本并同步
   assert.equal(restored.holdings.get('601318.SH')!.shares, 2100); // 2000 初始 + 100 买入
   assert.equal(restored.holdings.get('600941.SH')!.shares, 200);
   assert.equal(restored.trades.length, state.trades.length);
-  assert.equal(restored.stocks.get('601318.SH')!.holdingShares, 2100);
-  assert.equal(restored.stocks.get('600941.SH')!.holdingShares, 200);
-  assert.equal(restored.stocks.get('000333.SZ')!.holdingShares, 0);
+  /** 持仓是账本事实，快照读取时叠加，不在股票缓存里重复维护。 */
+  assert.equal(getStockSnapshot(restored, '601318.SH').holdingShares, 2100);
+  assert.equal(getStockSnapshot(restored, '600941.SH').holdingShares, 200);
+  assert.equal(getStockSnapshot(restored, '000333.SZ').holdingShares, 0);
 });
 
 test('hydratePortfolio 过滤无效代码与非法交易记录，空记录保留演示初始状态', () => {
   const state = createDemoState();
   hydratePortfolio(state, {
-    watchlist: ['601318.SH', 'INVALID', 123],
+    watchlist: ['601318.SH', 'INVALID', 123] as unknown as string[],
     cash: -100,
     holdings: [{ symbol: '601318.SH', shares: 50, cost: 10, assumptionVersion: 1 }],
     trades: [
       {
         id: 'bad',
         symbol: '601318.SH',
-        side: 'hold',
+        name: '演示脏数据',
+        side: 'hold' as unknown as 'buy',
         shares: 100,
         price: 40,
         grossAmount: 4000,
@@ -908,7 +1064,7 @@ test('hydratePortfolio 过滤无效代码与非法交易记录，空记录保留
   assert.equal(state.cash, 50_000);
   /** 非法 side 被过滤，账本为空。 */
   assert.equal(state.trades.length, 0);
-  /** 持仓字段同步。 */
-  assert.equal(state.stocks.get('601318.SH')!.holdingShares, 50);
+  /** 持仓字段由账本派生。 */
+  assert.equal(getStockSnapshot(state, '601318.SH').holdingShares, 50);
   assert.equal(state.holdings.get('601318.SH')!.shares, 50);
 });

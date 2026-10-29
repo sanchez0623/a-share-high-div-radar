@@ -11,6 +11,11 @@ export const STAMP_DUTY_RATE = 0.0005;
 /** 演示口径：持股 1 个月至 1 年的红利税 10%。 */
 export const DIVIDEND_TAX_RATE = 0.1;
 
+/** A股最小报价单位（元），成交价格必须是它的整数倍。 */
+export const PRICE_TICK = 0.01;
+/** 最小有效成交价格（元）；低于它的价格会让成交金额舍入成零，必须拒绝。 */
+export const MIN_TRADE_PRICE = 0.01;
+
 export interface TradeFees {
   /** 佣金（不足 5 元按 5 元计）。 */
   commission: number;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BellRing,
   ChartCandlestick,
@@ -22,6 +22,7 @@ import type {
   RiskEventInput,
   RiskVerificationInput,
   StockDetailResponse,
+  TradeResponse,
 } from '../shared/types.ts';
 import { api } from './api.ts';
 import { ChecklistModal, TradeModal, WatchlistModal } from './components/AppModals.tsx';
@@ -60,12 +61,25 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [refreshing, setRefreshing] = useState(false);
 
+  // 请求序列号：只有最新一次请求的响应可以写入状态，避免乱序响应覆盖新数据。
+  const dashboardSeq = useRef(0);
+  const detailSeq = useRef(0);
+  // 最新选中的标的，供异步回调判断自己是否已经过期。
+  const latestSymbolRef = useRef(selectedSymbol);
+
+  useEffect(() => {
+    latestSymbolRef.current = selectedSymbol;
+  }, [selectedSymbol]);
+
   const loadData = useCallback(async () => {
+    const seq = ++dashboardSeq.current;
     try {
       const response = await api.dashboard();
+      if (seq !== dashboardSeq.current) return;
       setData(response);
       setError('');
     } catch (reason) {
+      if (seq !== dashboardSeq.current) return;
       setError((reason as Error).message);
       throw reason;
     }
@@ -75,13 +89,30 @@ export default function App() {
     loadData().catch(() => undefined).finally(() => setLoading(false));
   }, [loadData]);
 
+  // 交易响应已携带按新现金与持仓重算的派生快照：就地合并，避免评分停留在交易前。
+  const applyTrade = useCallback((result: TradeResponse) => {
+    const { stocks, ...portfolio } = result;
+    setData((previous) => {
+      if (!previous) return previous;
+      const fresh = new Map(stocks.map((stock) => [stock.symbol, stock]));
+      return {
+        ...previous,
+        stocks: previous.stocks.map((stock) => fresh.get(stock.symbol) ?? stock),
+        tradeStocks: stocks,
+        portfolio,
+      };
+    });
+  }, []);
+
   useEffect(() => {
     if (!data || !selectedSymbol) return;
-    let active = true;
+    const seq = ++detailSeq.current;
     api.stock(selectedSymbol).then((response) => {
-      if (active) setDetail(response);
-    }).catch((reason: Error) => setToast(reason.message));
-    return () => { active = false; };
+      if (seq !== detailSeq.current) return;
+      setDetail(response);
+    }).catch((reason: Error) => {
+      if (seq === detailSeq.current) setToast(reason.message);
+    });
   }, [selectedSymbol, data]);
 
   useEffect(() => {
@@ -89,6 +120,9 @@ export default function App() {
       setSelectedSymbol(data.stocks[0]?.symbol ?? '');
     }
   }, [data, selectedSymbol]);
+
+  // 只有与当前选中标的匹配的详情才允许渲染与写入：切换期间旧详情立即失效。
+  const activeDetail = detail && detail.stock.symbol === selectedSymbol ? detail : null;
 
   const navigate = (next: View) => {
     setView(next);
@@ -115,17 +149,48 @@ export default function App() {
     }
   };
 
-  const saveAssumption = async (input: AssumptionInput) => {
-    const updated = await api.saveAssumption(selectedSymbol, input);
-    setDetail(updated);
-    setPreview(null);
-    await loadData();
-    setToast(`分红假设已保存为 v${updated.assumption.version}，计划价格已按该版本重算`);
-    navigate('plan');
+  /** 导出按钮走 fetch：跨设备部署时导出接口同样需要令牌头。 */
+  const exportWatchlist = async () => {
+    try {
+      await api.exportWatchlist();
+      setToast('观察仓 CSV 已开始下载');
+    } catch (reason) {
+      setToast((reason as Error).message || '导出失败，请稍后重试');
+    }
   };
 
-  const previewAssumption = async (input: AssumptionInput) => {
-    const result = await api.previewAssumption(selectedSymbol, input);
+  /** 统一的写操作收口：执行 mutation → 重新拉取看板 → 反馈结果；失败同时提示并抛回给表单。 */
+  const runMutation = useCallback(async (action: () => Promise<string | null>) => {
+    try {
+      const message = await action();
+      try {
+        await loadData();
+      } catch {
+        setToast('操作已生效，但重新读取看板失败，请稍后手动刷新');
+        return;
+      }
+      if (message) setToast(message);
+    } catch (reason) {
+      setToast((reason as Error).message || '操作失败，请稍后重试');
+      throw reason;
+    }
+  }, [loadData]);
+
+  const saveAssumption = (symbol: string, input: AssumptionInput) => runMutation(async () => {
+    const updated = await api.saveAssumption(symbol, input);
+    // 保存期间可能已切入其他标的：不再回写旧详情，也不跳转。
+    if (symbol !== latestSymbolRef.current) {
+      return `${updated.stock.name} 的分红假设已保存为 v${updated.assumption.version}，当前已切换到其他标的`;
+    }
+    setDetail(updated);
+    setPreview(null);
+    navigate('plan');
+    return `分红假设已保存为 v${updated.assumption.version}，计划价格已按该版本重算`;
+  });
+
+  const previewAssumption = async (symbol: string, input: AssumptionInput) => {
+    const result = await api.previewAssumption(symbol, input);
+    if (symbol !== latestSymbolRef.current) return;
     setPreview(result);
     setToast(`已生成临时价格阶梯（保存后为 v${result.assumption.version}）`);
     navigate('plan');
@@ -133,31 +198,26 @@ export default function App() {
 
   const savePreview = async () => {
     if (!preview) return;
-    const { forecastYear, scenario, requiredYield } = preview.assumption;
-    await saveAssumption({ forecastYear, scenario, requiredYield });
+    const { symbol, forecastYear, scenario, requiredYield } = preview.assumption;
+    await saveAssumption(symbol, { forecastYear, scenario, requiredYield });
   };
 
-  const verifyRisk = async (id: string, input: RiskVerificationInput) => {
+  const verifyRisk = (id: string, input: RiskVerificationInput) => runMutation(async () => {
     const result = await api.verifyRisk(id, input);
-    await loadData();
-    setToast(`核验已记录：${result.risk.statusReason}`);
-  };
+    return `核验已记录：${result.risk.statusReason}`;
+  });
 
-  const addRisk = async (input: RiskEventInput) => {
+  const addRisk = (input: RiskEventInput) => runMutation(async () => {
     const result = await api.addRisk(input);
-    await loadData();
-    setToast(
-      result.risk.severity === 'high'
-        ? '已登记高风险事项，该股票原有核验全部失效，需重新核验'
-        : `已登记风险事项：${result.risk.title}`,
-    );
-  };
+    return result.risk.severity === 'high'
+      ? '已登记高风险事项，该股票原有核验全部失效，需重新核验'
+      : `已登记风险事项：${result.risk.title}`;
+  });
 
-  const refreshRiskSource = async (id: string) => {
+  const refreshRiskSource = (id: string) => runMutation(async () => {
     const result = await api.updateRiskSource(id, {});
-    await loadData();
-    setToast(`原文已更新至 v${result.risk.source.revision}，原核验已失效`);
-  };
+    return `原文已更新至 v${result.risk.source.revision}，原核验已失效`;
+  });
 
   const searchResults = useMemo(() => {
     if (!data || !search.trim()) return [];
@@ -206,7 +266,7 @@ export default function App() {
               {search && <div className="search-results">{searchResults.length ? searchResults.map((stock) => <button key={stock.symbol} onClick={() => selectStock(stock.symbol)}><strong>{stock.name}</strong><span>{stock.symbol}</span><em>{stock.dividendYield.toFixed(2)}%</em></button>) : <p>观察仓中没有匹配结果</p>}</div>}
             </div>
             <button className={`icon-button topbar-button ${refreshing ? 'spinning' : ''}`} onClick={refresh} title="重新读取演示快照" aria-label="刷新数据"><RefreshCw size={17} /></button>
-            <a className="icon-button topbar-button export-button" href="/api/export/watchlist" download title="导出观察仓 CSV" aria-label="导出观察仓"><Download size={17} /></a>
+            <button className="icon-button topbar-button export-button" onClick={exportWatchlist} title="导出观察仓 CSV" aria-label="导出观察仓"><Download size={17} /></button>
             <button className="notification-button" onClick={() => navigate('risk')} aria-label="查看风险通知"><BellRing size={17} /><span>{openRiskCount}</span></button>
             <div className="research-avatar">研</div>
           </div>
@@ -214,9 +274,9 @@ export default function App() {
 
         <main className="main-content">
           {view === 'dashboard' && <Dashboard data={data} onSelect={selectStock} onManage={() => setModal('watchlist')} />}
-          {view === 'detail' && (detail ? <StockDetail detail={detail} stocks={data.stocks} onSelect={selectStock} onBack={() => navigate('dashboard')} onOpenPlan={() => navigate('plan')} /> : detailLoading)}
-          {view === 'lab' && (detail ? <DividendLab detail={detail} stocks={data.stocks} onSelect={selectStock} onSave={saveAssumption} onPreview={previewAssumption} /> : detailLoading)}
-          {view === 'plan' && (detail ? <PlanPage detail={detail} stocks={data.stocks} onSelect={selectStock} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
+          {view === 'detail' && (activeDetail ? <StockDetail detail={activeDetail} stocks={data.stocks} onSelect={selectStock} onBack={() => navigate('dashboard')} onOpenPlan={() => navigate('plan')} /> : detailLoading)}
+          {view === 'lab' && (activeDetail ? <DividendLab detail={activeDetail} stocks={data.stocks} onSelect={selectStock} onSave={(input) => saveAssumption(activeDetail.stock.symbol, input)} onPreview={(input) => previewAssumption(activeDetail.stock.symbol, input)} /> : detailLoading)}
+          {view === 'plan' && (activeDetail ? <PlanPage detail={activeDetail} stocks={data.stocks} onSelect={selectStock} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
           {view === 'risk' && <RiskPage data={data} onVerify={verifyRisk} onAddRisk={addRisk} onRefreshSource={refreshRiskSource} />}
           {view === 'portfolio' && <PortfolioPage data={data} onTrade={() => setModal('trade')} />}
           {view === 'blueprint' && <BlueprintPage />}
@@ -224,8 +284,8 @@ export default function App() {
       </div>
 
       {modal === 'watchlist' && <WatchlistModal onClose={() => setModal(null)} onChanged={loadData} />}
-      {modal === 'trade' && <TradeModal stocks={data.stocks} initialSymbol={selectedSymbol} onClose={() => setModal(null)} onTraded={async () => { await loadData(); setToast('模拟交易已记录，组合现金流已更新'); }} />}
-      {modal === 'checklist' && detail && <ChecklistModal detail={detail} preview={preview} onClose={() => setModal(null)} onCopied={() => setToast('研究清单已复制到剪贴板')} />}
+      {modal === 'trade' && <TradeModal stocks={data.tradeStocks} initialSymbol={selectedSymbol} onClose={() => setModal(null)} onTraded={async (result) => { applyTrade(result); setToast('模拟交易已记录，组合现金流与评分已更新'); }} />}
+      {modal === 'checklist' && activeDetail && <ChecklistModal detail={activeDetail} preview={preview} onClose={() => setModal(null)} onCopied={() => setToast('研究清单已复制到剪贴板')} />}
       {toast && <Toast message={toast} onClose={() => setToast('')} />}
     </div>
   );

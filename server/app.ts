@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type {
@@ -9,39 +12,30 @@ import type {
   RiskMutationResponse,
   RiskSourcePatch,
   RiskVerificationInput,
-  SettingsPatch,
   Stock,
   StockDetailResponse,
   TradeRequest,
+  TradeResponse,
 } from '../shared/types.ts';
 import {
-  AS_OF,
-  AssumptionError,
-  DATA_META,
-  DATA_NOTICE,
-  RISK_POLICY,
-  RiskError,
-  TradeError,
-  addRiskEvent,
-  buildAllocation,
-  buildResearchPlan,
-  dispatchReminder,
-  executeTrade,
-  getPortfolio,
-  getRiskEvents,
-  getStockSnapshot,
   hydrateAssumptions,
-  hydratePortfolio,
-  hydrateRisks,
   parseAssumptionInput,
   previewAssumption,
   resolveAssumption,
-  reviewTrades,
   saveAssumption,
-  updateRiskSource,
-  verifyRisk,
-  type DemoState,
-} from './engine.ts';
+} from './assumptions.ts';
+import { AS_OF, DATA_META, DATA_NOTICE } from './config.ts';
+import { AssumptionError, RiskError, SettingsError, TradeError } from './errors.ts';
+import { buildAllocation, executeTrade, getPortfolio, hydratePortfolio } from './portfolio.ts';
+import { buildResearchPlan } from './research.ts';
+import { getRiskEvents, RISK_POLICY } from './risk-model.ts';
+import { addRiskEvent, hydrateRisks, updateRiskSource, verifyRisk } from './risk-actions.ts';
+import { createOriginGuard, createTokenGuard, isAllowedOrigin } from './security.ts';
+import { updateStockSettings } from './settings.ts';
+import { getStockSnapshot } from './snapshot.ts';
+import { commitPortfolioChange, commitResearchChange, collectPortfolioSymbols } from './state-change.ts';
+import { reviewTrades } from './trade-review.ts';
+import type { DemoState } from './state.ts';
 import { createMemoryAssumptionStore, type AssumptionStore } from './assumption-store.ts';
 import { createMemoryRiskStore, type RiskStore } from './risk-store.ts';
 import {
@@ -53,14 +47,33 @@ function normalizeSymbol(value: unknown): string {
   return typeof value === 'string' ? value.trim().toUpperCase() : '';
 }
 
+/** vite build 产物目录：一体化部署时由 Express 直接托管。 */
+export const DIST_DIR = fileURLToPath(new URL('../dist', import.meta.url));
+
+export interface AppOptions {
+  /** 是否托管 vite build 产物；前后端分离部署时关闭。 */
+  serveStatic?: boolean;
+  /** 额外允许的浏览器来源（独立前端域名）；缺省只放行本机回环来源。 */
+  allowedOrigins?: string[];
+  /** 访问令牌；配置后所有 /api 请求必须携带，绑定非回环地址时必填。 */
+  accessToken?: string;
+}
+
 export function createApp(
   state: DemoState,
   store: AssumptionStore = createMemoryAssumptionStore(),
   riskStore: RiskStore = createMemoryRiskStore(),
   portfolioStore: PortfolioStore = createMemoryPortfolioStore(),
+  options: AppOptions = {},
 ) {
   const app = express();
-  app.use(cors());
+  const extraOrigins = options.allowedOrigins ?? [];
+  app.disable('x-powered-by');
+  /** 先拦来源再交给 cors：预检请求同样按白名单拒绝，浏览器拿不到任何响应头。 */
+  app.use('/api', createOriginGuard(extraOrigins));
+  app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin, extraOrigins)) }));
+  /** 预检不带令牌，cors 已在此前结束 OPTIONS，因此令牌只约束真实请求。 */
+  app.use('/api', createTokenGuard(options.accessToken ?? ''));
   app.use(express.json());
 
   hydrateAssumptions(state, store.load());
@@ -91,8 +104,7 @@ export function createApp(
 
   /** 风险写操作统一返回最新风险事件与重算后的股票闸门。 */
   function respondWithRisk(res: Response, risk: RiskEvent): void {
-    const stock = getStockSnapshot(state, risk.symbol);
-    dispatchReminder(state, stock);
+    const { stock } = commitResearchChange(state, risk.symbol);
     const response: RiskMutationResponse = { risk, stock };
     res.json(response);
   }
@@ -136,6 +148,8 @@ export function createApp(
       asOf: AS_OF,
       dataMode: 'demo',
       stocks: Array.from(state.watchlist, (symbol) => getStockSnapshot(state, symbol)),
+      /** 交易候选与观察仓分离：移出观察仓的持仓仍必须可卖出。 */
+      tradeStocks: collectPortfolioSymbols(state).map((symbol) => getStockSnapshot(state, symbol)),
       portfolio: getPortfolio(state),
       risks: getRiskEvents(state),
       riskPolicy: RISK_POLICY,
@@ -172,8 +186,7 @@ export function createApp(
     try {
       saveAssumption(state, symbol, parseAssumptionInput(req.body));
       persistAssumptions();
-      const stock = getStockSnapshot(state, symbol);
-      dispatchReminder(state, stock);
+      const { stock } = commitResearchChange(state, symbol);
       res.json(buildDetail(stock));
     } catch (error) {
       if (error instanceof AssumptionError) {
@@ -207,47 +220,26 @@ export function createApp(
     }
   });
 
+  /** 设置项写操作：统一走 DTO 校验、白名单更新与结论重算，杜绝批量赋值。 */
   app.patch('/api/stocks/:symbol/settings', (req, res) => {
     const symbol = normalizeSymbol(req.params.symbol);
-    const current = state.stocks.get(symbol);
-    if (!current) {
+    if (!state.stocks.has(symbol)) {
       res.status(404).json({ error: '股票代码不存在' });
       return;
     }
-    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
-      res.status(400).json({ error: '请求体必须为JSON对象' });
-      return;
-    }
 
-    const patch = req.body as SettingsPatch & { riskVerified?: unknown };
-    if (patch.riskVerified !== undefined) {
-      res.status(400).json({ error: '风险状态由风险事件核验派生，请在风险哨兵中逐条核验' });
-      return;
+    try {
+      const { assumptionUpdated } = updateStockSettings(state, symbol, req.body);
+      if (assumptionUpdated) persistAssumptions();
+      const { stock } = commitResearchChange(state, symbol);
+      res.json(stock);
+    } catch (error) {
+      if (error instanceof SettingsError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      throw error;
     }
-    if (
-      patch.buyThreshold !== undefined &&
-      (typeof patch.buyThreshold !== 'number' ||
-        !Number.isFinite(patch.buyThreshold) ||
-        patch.buyThreshold < 3 ||
-        patch.buyThreshold > 10)
-    ) {
-      res.status(400).json({ error: 'buyThreshold必须在3到10之间' });
-      return;
-    }
-
-    state.stocks.set(symbol, { ...current, buyThreshold: patch.buyThreshold ?? current.buyThreshold });
-    const saved = state.assumptions.get(symbol);
-    if (patch.buyThreshold !== undefined && saved) {
-      saveAssumption(state, symbol, {
-        forecastYear: saved.forecastYear,
-        scenario: saved.scenario,
-        requiredYield: patch.buyThreshold,
-      });
-      persistAssumptions();
-    }
-    const stock = getStockSnapshot(state, symbol);
-    dispatchReminder(state, stock);
-    res.json(stock);
   });
 
   app.post('/api/watchlist', (req, res) => {
@@ -331,9 +323,12 @@ export function createApp(
 
   app.post('/api/portfolio/trade', (req, res) => {
     try {
-      const portfolio = executeTrade(state, req.body as TradeRequest);
+      executeTrade(state, req.body as TradeRequest);
       persistPortfolio();
-      res.json(portfolio);
+      /** 现金与持仓已变化：统一重算组合账本与派生快照，响应直接携带最新评分。 */
+      const { portfolio, stocks } = commitPortfolioChange(state);
+      const response: TradeResponse = { ...portfolio, stocks };
+      res.json(response);
     } catch (error) {
       if (error instanceof TradeError) {
         res.status(400).json({ error: error.message });
@@ -399,6 +394,8 @@ export function createApp(
       .set({
         'Content-Type': 'text/csv; charset=utf-8',
         'Content-Disposition': `attachment; filename="watchlist-${AS_OF}.csv"`,
+        /** 评分含现金信号：交易后必须按最新账本重算，禁止浏览器复用旧文件。 */
+        'Cache-Control': 'no-store',
       })
       .send(`\uFEFF${csv}`);
   });
@@ -406,6 +403,28 @@ export function createApp(
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: '接口不存在' });
   });
+
+  /**
+   * 一体化部署：Express 同时托管 API 与 vite build 产物（dist）。
+   * 前后端分离时以 --api-only 关闭，前端产物交由网关或静态服务器托管，/api 反向代理到本服务。
+   */
+  if (options.serveStatic !== false) {
+    if (existsSync(DIST_DIR)) {
+      app.use(express.static(DIST_DIR, { index: false }));
+      /** SPA 回退：非 API 的 GET/HEAD 一律返回 index.html，交由前端路由处理。 */
+      app.use((req, res, next) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          next();
+          return;
+        }
+        if (req.path.startsWith('/api')) {
+          next();
+          return;
+        }
+        res.sendFile(path.join(DIST_DIR, 'index.html'));
+      });
+    }
+  }
 
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (error instanceof SyntaxError && 'body' in error) {

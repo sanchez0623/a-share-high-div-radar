@@ -16,6 +16,7 @@ import type {
   ResearchLevel,
   RiskEvent,
   RiskEventInput,
+  RiskGateStatus,
   RiskSeverity,
   RiskType,
   RiskVerificationInput,
@@ -41,6 +42,14 @@ const SEVERITY_LABEL: Record<RiskSeverity, string> = {
   high: '高优先级',
   medium: '中优先级',
   low: '低优先级',
+};
+
+/** 股票级状态只用服务端派生的 gate.status 渲染，页面不再依据布尔字段自行推断。 */
+const GATE_LABEL: Record<RiskGateStatus, string> = {
+  clear: '未登记风险',
+  verified: '全部有效',
+  review: 'L3 阻断',
+  blocked: '高风险阻断',
 };
 
 const LEVELS: ResearchLevel[] = ['L1', 'L2', 'L3'];
@@ -135,20 +144,8 @@ export default function RiskPage({ data, onVerify, onAddRisk, onRefreshSource }:
               <div className="risk-gate-row" key={stock.symbol}>
                 <strong>{stock.name}</strong>
                 <span>{stock.symbol}</span>
-                <em
-                  className={
-                    stock.riskGate.verified
-                      ? 'gate-verified'
-                      : stock.riskGate.highestOpenSeverity === 'high'
-                        ? 'gate-blocked'
-                        : 'gate-review'
-                  }
-                >
-                  {stock.riskGate.verified
-                    ? '全部有效'
-                    : stock.riskGate.highestOpenSeverity === 'high'
-                      ? '高风险阻断'
-                      : 'L3 阻断'}
+                <em className={`gate-${stock.riskGate.status}`}>
+                  {GATE_LABEL[stock.riskGate.status]}
                 </em>
                 <span>未关闭 {stock.riskGate.openCount}/{stock.riskGate.totalCount}</span>
                 <span>允许 {stock.riskGate.allowedLevels.join(' / ') || '无'}</span>

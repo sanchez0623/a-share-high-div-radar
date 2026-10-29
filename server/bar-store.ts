@@ -44,7 +44,8 @@ export function saveBars(symbol: string, bars: PriceBar[]): void {
   const filePath = barsPath(symbol);
   mkdirSync(dirname(filePath), { recursive: true });
   const payload: BarsFile = { version: 1, symbol, bars };
-  const temporaryPath = `${filePath}.tmp`;
+  // 唯一临时名（pid + 时间戳）：避免 tsx 重启并发窗口下 rename 竞态 ENOENT。
+  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(temporaryPath, JSON.stringify(payload, null, 2), 'utf8');
   renameSync(temporaryPath, filePath);
 }

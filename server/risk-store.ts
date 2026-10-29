@@ -64,7 +64,8 @@ export function createFileRiskStore(filePath: string): RiskStore {
     },
     save(items) {
       mkdirSync(dirname(filePath), { recursive: true });
-      const temporaryPath = `${filePath}.tmp`;
+      // 唯一临时名（pid + 时间戳）：避免 tsx 重启并发窗口下 rename 竞态 ENOENT。
+      const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
       writeFileSync(temporaryPath, JSON.stringify({ version: 1, items }, null, 2), 'utf8');
       renameSync(temporaryPath, filePath);
     },

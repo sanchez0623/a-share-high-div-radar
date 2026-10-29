@@ -42,7 +42,8 @@ export function loadLatestQuotes(): LatestQuoteSnapshot {
 export function saveLatestQuotes(quotes: RawQuote[]): void {
   mkdirSync(dirname(), { recursive: true });
   const payload: LatestQuotesFile = { version: 1, savedAt: Date.now(), quotes };
-  const temporaryPath = `${FILE_PATH}.tmp`;
+  // 唯一临时名（pid + 时间戳）：避免 tsx 重启并发窗口下 rename 竞态 ENOENT。
+  const temporaryPath = `${FILE_PATH}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(temporaryPath, JSON.stringify(payload, null, 2), 'utf8');
   renameSync(temporaryPath, FILE_PATH);
 }

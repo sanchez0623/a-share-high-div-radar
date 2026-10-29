@@ -43,20 +43,21 @@ export interface DemoState {
 
 /**
  * 写事务的可变副本：所有写路由先在副本上完成变更，落盘成功后才替换内存。
- * 行情、分红历史与质量输入只读，直接共享引用；其余字段逐层复制，
- * 保证变更过程中的任何失败都不会污染当前进程的内存状态。
+ * 行情、分红历史与质量输入的「条目」只读，条目内部数据共享引用；
+ * 但 Map 本身必须复制：动态添加/停用股票要增删这些 Map 的键，
+ * 复制后落盘失败才不会把半成品状态泄漏进当前内存。
  */
 export function cloneDemoState(state: DemoState): DemoState {
   return {
     stocks: new Map(
       Array.from(state.stocks, ([symbol, stock]) => [symbol, structuredClone(stock)]),
     ),
-    histories: state.histories,
-    dividends: state.dividends,
+    histories: new Map(state.histories),
+    dividends: new Map(state.dividends),
     assumptions: new Map(
       Array.from(state.assumptions, ([symbol, item]) => [symbol, structuredClone(item)]),
     ),
-    qualityInputs: state.qualityInputs,
+    qualityInputs: new Map(state.qualityInputs),
     risks: state.risks.map((record) => structuredClone(record)),
     watchlist: new Set(state.watchlist),
     cash: state.cash,
@@ -73,6 +74,9 @@ export function cloneDemoState(state: DemoState): DemoState {
 /** 落盘成功后的唯一提交点：整体替换副本中可变的字段，外部持有的 state 引用依然有效。 */
 export function commitDemoState(target: DemoState, draft: DemoState): void {
   target.stocks = draft.stocks;
+  target.histories = draft.histories;
+  target.dividends = draft.dividends;
+  target.qualityInputs = draft.qualityInputs;
   target.assumptions = draft.assumptions;
   target.risks = draft.risks;
   target.watchlist = draft.watchlist;

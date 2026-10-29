@@ -5,6 +5,8 @@ import { createFileAssumptionStore } from './assumption-store.ts';
 import { createFileSettingsStore } from './settings-store.ts';
 import { createFileRiskStore } from './risk-store.ts';
 import { createFilePortfolioStore } from './portfolio-store.ts';
+import { createFileStockStore } from './stock-store.ts';
+import { hydrateStocks } from './stock-registration.ts';
 import { PersistenceError, RiskPersistenceError } from './errors.ts';
 import { DEFAULT_HOST, deploymentAuthError, isLoopbackHost, parseAllowedOrigins, parsePublicDeployment } from './security.ts';
 import { activateLiveMeta, AS_OF, DATA_META } from './config.ts';
@@ -15,7 +17,8 @@ import { tencentProvider } from './providers/tencent.ts';
 import { fetchDailyBarsBatch } from './providers/kline-eastmoney.ts';
 import { fetchIndustries } from './providers/industry-eastmoney.ts';
 import { fetchDividendEvents } from './providers/tencent-fqkline.ts';
-import { saveDividendEvents } from './dividend-event-store.ts';
+import { loadDividendEventsFile, saveDividendEvents } from './dividend-event-store.ts';
+import { applyDividendHistory } from './dividend-history.ts';
 import { ensureTradingCalendar, refreshTradingCalendar } from './trading-calendar.ts';
 import { createQuoteService } from './quote-service.ts';
 import { startQuoteScheduler } from './quote-scheduler.ts';
@@ -36,11 +39,19 @@ const assumptionFile = fileURLToPath(new URL('./.data/assumptions.json', import.
 const settingsFile = fileURLToPath(new URL('./.data/settings.json', import.meta.url));
 const riskFile = fileURLToPath(new URL('./.data/risks.json', import.meta.url));
 const portfolioFile = fileURLToPath(new URL('./.data/portfolio.json', import.meta.url));
+const stockFile = fileURLToPath(new URL('./.data/stocks.json', import.meta.url));
 
 const state = createDemoState();
+/** 动态添加股票的落盘：必须在行情装配前恢复，自定义股票才能参与真实日线同步。 */
+const stockStore = createFileStockStore(stockFile);
 
 /** live 模式就绪标志：真实日线装配成功后才允许实时价覆盖日线（避免污染演示序列）。 */
 let liveActive = false;
+
+/** 分红事件同步窗口（年）：够覆盖「连续 N 年」的真实回溯，同时控制启动耗时。 */
+const DIVIDEND_EVENT_YEARS = 15;
+/** 分红事件缓存新鲜度：7 天内视为有效，跳过重新同步（分红是低频数据）。 */
+const DIVIDEND_SYNC_FRESH_MS = 7 * 86_400_000;
 
 /** 上海时区今日（YYYY-MM-DD）。 */
 function shanghaiToday(): string {
@@ -197,6 +208,24 @@ if (publicDeployment && allowedOrigins.length === 0) {
  * 否则后续写盘会用演示状态覆盖真实的高风险记录。
  */
 async function start(): Promise<void> {
+  /** 恢复动态添加的自定义股票，并把停用记录从演示全集拆除（失败关闭：文件损坏拒绝启动）。 */
+  try {
+    hydrateStocks(state, stockStore.load());
+  } catch (error) {
+    if (error instanceof PersistenceError) {
+      console.error(
+        [
+          '拒绝启动：股票列表无法安全恢复（文件损坏或不可读）。',
+          `原因：${error.message}`,
+          '为避免覆盖原文件，服务不会启动。请先备份 server/.data/stocks.json，',
+          '修复或移走该文件后重试。',
+        ].join('\n'),
+      );
+      process.exit(1);
+    }
+    throw error;
+  }
+
   // 真实日线装配失败不阻断启动：自动回退演示数据（dataMode 保持 demo）。
   liveActive = await prepareLiveHistory();
 
@@ -207,17 +236,46 @@ async function start(): Promise<void> {
     // 行业分类真实化（东财 f100）：失败保留种子口径。
     await refreshSectors();
     // 分红事件（腾讯 fqkline 免费路线）：落盘缓存供研究口径接入，失败不阻断。
-    try {
-      let synced = 0;
-      for (const symbol of state.stocks.keys()) {
-        saveDividendEvents(symbol, await fetchDividendEvents(symbol, 5));
-        synced += 1;
+    // 7 天内同步过的直接复用缓存：分红是低频数据，避免每次启动都重拉 15 年事件。
+    let synced = 0;
+    let reused = 0;
+    let failedSymbols: string[] = [];
+    for (const symbol of state.stocks.keys()) {
+      const cached = loadDividendEventsFile(symbol);
+      const cachedAt = cached ? Date.parse(cached.syncedAt) : NaN;
+      if (Number.isFinite(cachedAt) && Date.now() - cachedAt < DIVIDEND_SYNC_FRESH_MS) {
+        reused += 1;
+        continue;
       }
-      console.log(`分红事件已同步（近5年）：${synced} 只`);
-    } catch (reason) {
-      console.warn(`分红事件同步失败：${(reason as Error).message}`);
+      // 单只失败只记录并继续，不中断整轮同步（一只失败不应拖垮其余股票）。
+      try {
+        saveDividendEvents(symbol, await fetchDividendEvents(symbol, DIVIDEND_EVENT_YEARS));
+        synced += 1;
+      } catch (reason) {
+        failedSymbols.push(symbol);
+        console.warn(`分红事件同步失败（${symbol}）：${(reason as Error).message}`);
+      }
+    }
+    console.log(
+      `分红事件已同步（近${DIVIDEND_EVENT_YEARS}年）：${synced} 只，缓存复用 ${reused} 只` +
+        `${failedSymbols.length ? `，失败 ${failedSymbols.length} 只` : ''}`,
+    );
+  }
+
+  // 真实分红历史接入研究口径：只依赖落盘缓存（不要求 live 模式），
+  // 无缓存或事件不含已完结年度的股票保持原口径（种子/空），页面脚注如实标注。
+  let dividendApplied = 0;
+  for (const symbol of state.stocks.keys()) {
+    const snapshot = loadDividendEventsFile(symbol);
+    if (snapshot && applyDividendHistory(state, symbol, snapshot.events, snapshot.syncedAt)) {
+      dividendApplied += 1;
     }
   }
+  console.log(
+    dividendApplied > 0
+      ? `真实分红历史已接入（腾讯fqkline）：${dividendApplied}/${state.stocks.size} 只`
+      : '真实分红历史不可用，保持演示口径',
+  );
 
   /** 收盘固化：先刷一次终值（覆盖当日 bar），再把全部日线落盘。 */
   const persistEodBars = async () => {
@@ -234,7 +292,7 @@ async function start(): Promise<void> {
       createFileAssumptionStore(assumptionFile),
       createFileRiskStore(riskFile),
       createFilePortfolioStore(portfolioFile),
-      { serveStatic: !apiOnly, allowedOrigins, accessToken, quoteService, settingsStore: createFileSettingsStore(settingsFile) },
+      { serveStatic: !apiOnly, allowedOrigins, accessToken, quoteService, settingsStore: createFileSettingsStore(settingsFile), stockStore },
     );
   } catch (error) {
     if (error instanceof PersistenceError) {

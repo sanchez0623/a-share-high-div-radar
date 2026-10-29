@@ -366,6 +366,19 @@ export function hydratePortfolio(state: DemoState, persisted: PersistedPortfolio
   }
 }
 
+/**
+ * 交易 id 取既有最大序号 + 1：恢复落盘会过滤无效记录，账本长度小于最大序号，
+ * 按 length+1 生成会与既有 id 撞号。
+ */
+function nextTradeId(trades: TradeRecord[]): string {
+  let max = 0;
+  for (const trade of trades) {
+    const match = /^trade-(\d+)$/.exec(trade.id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return `trade-${max + 1}`;
+}
+
 /** 交易写操作：校验 → 更新现金与持仓 → 冻结成交时的研究快照 → 记入账本。 */
 export function executeTrade(state: DemoState, request: TradeRequest): Portfolio {
   if (!request || typeof request.symbol !== 'string' || !state.stocks.has(request.symbol)) {
@@ -397,9 +410,11 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
     throw new TradeError('成交金额按0.01元舍入后不足最小金额，交易未执行');
   }
   const fees = estimateTradeFees(request.side, amount);
+  /** 记账口径：税前=按成交金额毛额记账（费用与印花税仅展示）；税后=按扣除费用与印花税后的净额记账。缺省为税后。 */
+  const taxBasis: TaxBasis = request.taxBasis === 'pre_tax' ? 'pre_tax' : 'after_tax';
 
   if (request.side === 'buy') {
-    const outflow = round(amount + fees.total);
+    const outflow = taxBasis === 'pre_tax' ? amount : round(amount + fees.total);
     if (outflow > state.cash + Number.EPSILON) {
       throw new TradeError('可用现金不足，交易未执行');
     }
@@ -414,13 +429,13 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
     if (request.shares > holding.shares) {
       throw new TradeError('持仓数量不足，交易未执行');
     }
-    /** 卖出现金流入：成交金额扣除佣金、过户费与印花税；费用高于成交金额时净回款为负。 */
-    const netProceeds = round(amount - fees.total);
-    if (netProceeds <= 0) {
+    /** 记账现金流入：税前为成交金额毛额；税后扣除佣金、过户费与印花税，费用高于成交金额时净回款为负。 */
+    const bookedInflow = taxBasis === 'pre_tax' ? amount : round(amount - fees.total);
+    if (bookedInflow <= 0) {
       throw new TradeError('卖出净回款不为正：成交金额不足以覆盖交易费用，交易未执行');
     }
-    /** 净回款计入现金后不得为负，费用吞掉现金的卖出必须在改动持仓前拒绝。 */
-    const cashAfter = round(state.cash + netProceeds);
+    /** 记账现金计入后不得为负，必须在改动持仓前拒绝。 */
+    const cashAfter = round(state.cash + bookedInflow);
     if (cashAfter < 0) {
       throw new TradeError('成交后现金不足，交易未执行');
     }
@@ -430,7 +445,6 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
   }
 
   const executedAt = request.executedAt ?? AS_OF;
-  const taxBasis: TaxBasis = request.taxBasis === 'after_tax' ? 'after_tax' : 'pre_tax';
   const planLevel: Exclude<ResearchLevel, 'L0'> | null =
     request.planLevel === 'L1' || request.planLevel === 'L2' || request.planLevel === 'L3'
       ? request.planLevel
@@ -474,7 +488,7 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
   };
 
   state.trades.unshift({
-    id: `trade-${state.trades.length + 1}`,
+    id: nextTradeId(state.trades),
     symbol: request.symbol,
     name: stock.name,
     side: request.side,
@@ -484,7 +498,13 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
     fee: round(fees.total - fees.stampDuty),
     tax: fees.stampDuty,
     netAmount:
-      request.side === 'buy' ? round(amount + fees.total) : round(amount - fees.total),
+      request.side === 'buy'
+        ? taxBasis === 'pre_tax'
+          ? amount
+          : round(amount + fees.total)
+        : taxBasis === 'pre_tax'
+          ? amount
+          : round(amount - fees.total),
     executedAt,
     taxBasis,
     assumptionVersion: state.assumptions.get(request.symbol)?.version ?? null,

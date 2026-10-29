@@ -6,9 +6,11 @@ import type {
   ResearchLevel,
   Stock,
   StockDetailResponse,
+  StockRegistrationInput,
   TaxBasis,
   TradeResponse,
 } from '../../shared/types.ts';
+import { normalizeSymbol } from '../../shared/quote-types.ts';
 import { forecastSourceLabel, scenarioMeta } from '../../shared/assumptions.ts';
 import { MIN_TRADE_PRICE, PRICE_TICK, estimateTradeFees } from '../../shared/costs.ts';
 import { api } from '../api.ts';
@@ -18,22 +20,41 @@ import { LevelBadge, Modal } from './UI.tsx';
 export function WatchlistModal({ onClose, onChanged }: { onClose: () => void; onChanged: () => Promise<void> }) {
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [query, setQuery] = useState('');
+  const [code, setCode] = useState('');
+  const [forecast, setForecast] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  /** 疑似停牌的待确认请求：保留原输入，用户确认后带 confirmSuspended 重发。 */
+  const [pendingConfirm, setPendingConfirm] = useState<{ input: StockRegistrationInput; message: string } | null>(null);
   // 观察仓请求序列号：只接受最新一次请求的列表，避免乱序响应回滚观察仓状态。
   const catalogSeq = useRef(0);
 
-  useEffect(() => {
+  const load = async () => {
     const seq = ++catalogSeq.current;
-    api.catalog()
-      .then((result) => { if (seq === catalogSeq.current) setCatalog(result); })
-      .catch((reason: Error) => { if (seq === catalogSeq.current) setError(reason.message); });
+    try {
+      const result = await api.catalog(true);
+      if (seq === catalogSeq.current) setCatalog(result);
+    } catch (reason) {
+      if (seq === catalogSeq.current) setError((reason as Error).message);
+    }
+  };
+
+  useEffect(() => {
+    void load();
   }, []);
+
+  const refreshAfterChange = async () => {
+    await load();
+    await onChanged();
+  };
 
   const toggle = async (item: CatalogItem) => {
     const seq = ++catalogSeq.current;
     setBusy(item.symbol);
     setError('');
+    setSuccess('');
     try {
       const result = item.inWatchlist ? await api.removeWatchlist(item.symbol) : await api.addWatchlist(item.symbol);
       if (seq === catalogSeq.current) setCatalog(result);
@@ -45,19 +66,124 @@ export function WatchlistModal({ onClose, onChanged }: { onClose: () => void; on
     }
   };
 
+  const setStatus = async (item: CatalogItem, enabled: boolean) => {
+    const seq = ++catalogSeq.current;
+    setBusy(item.symbol);
+    setError('');
+    setSuccess('');
+    try {
+      await api.setStockStatus(item.symbol, enabled);
+      await refreshAfterChange();
+    } catch (reason) {
+      if (seq === catalogSeq.current) setError((reason as Error).message);
+    } finally {
+      if (seq === catalogSeq.current) setBusy(null);
+    }
+  };
+
+  const submitAdd = async (input: StockRegistrationInput) => {
+    setAdding(true);
+    setError('');
+    setSuccess('');
+    try {
+      const stock = await api.addStock(input);
+      setPendingConfirm(null);
+      setCode('');
+      setForecast('');
+      setSuccess(`已添加 ${stock.name}（${stock.symbol}），历史日线与基础数据已同步`);
+      await refreshAfterChange();
+    } catch (reason) {
+      const stockError = reason as Error & { confirmRequired?: boolean };
+      if (stockError.confirmRequired) {
+        setPendingConfirm({ input, message: stockError.message });
+      } else {
+        setError(stockError.message);
+      }
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const submit = () => {
+    setError('');
+    setSuccess('');
+    let symbol: string;
+    try {
+      symbol = normalizeSymbol(code);
+    } catch (reason) {
+      setError((reason as Error).message);
+      return;
+    }
+    const trimmed = forecast.trim();
+    let forecastDividend: number | undefined;
+    if (trimmed !== '') {
+      const value = Number(trimmed);
+      if (!Number.isFinite(value) || value < 0) {
+        setError('预测分红必须为非负数字');
+        return;
+      }
+      forecastDividend = value;
+    }
+    void submitAdd({ symbol, forecastDividend });
+  };
+
   const filtered = catalog.filter((item) => `${item.name}${item.symbol}${item.sector}`.toLowerCase().includes(query.toLowerCase()));
   return (
     <Modal title="管理观察仓" eyebrow="WATCHLIST UNIVERSE" onClose={onClose}>
       <p className="modal-intro">把想长期跟踪的公司放进研究视野，而不是把每一次涨跌都变成行动。</p>
+      <div className="add-stock">
+        <div className="add-stock-row">
+          <label className="modal-search add-stock-code">
+            <Search size={17} />
+            <input
+              value={code}
+              onChange={(event) => setCode(event.target.value)}
+              onKeyDown={(event) => event.key === 'Enter' && !adding && code.trim() && submit()}
+              placeholder="输入6位代码添加新股票，如 601288"
+              aria-label="新股票代码"
+            />
+          </label>
+          <input
+            className="add-stock-forecast"
+            value={forecast}
+            onChange={(event) => setForecast(event.target.value)}
+            onKeyDown={(event) => event.key === 'Enter' && !adding && code.trim() && submit()}
+            placeholder="预测分红/股（选填）"
+            inputMode="decimal"
+            aria-label="预测每股分红"
+          />
+          <button className="button button-secondary" disabled={adding || !code.trim()} onClick={submit}>
+            {adding ? '同步中…' : '添加'}
+          </button>
+        </div>
+        <small className="add-stock-hint">自动拉取名称、行业与历史日线并加入观察仓；预测分红可稍后在分红实验室调整。</small>
+      </div>
+      {pendingConfirm && (
+        <div className="form-error" role="alert">
+          {pendingConfirm.message}
+          <div className="confirm-actions">
+            <button className="button button-dark" disabled={adding} onClick={() => submitAdd({ ...pendingConfirm.input, confirmSuspended: true })}>仍要添加</button>
+            <button className="button button-ghost" disabled={adding} onClick={() => setPendingConfirm(null)}>取消</button>
+          </div>
+        </div>
+      )}
+      {success && <p className="form-success">{success}</p>}
+      {error && !pendingConfirm && <p className="form-error">{error}</p>}
       <label className="modal-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索公司、代码或行业" /></label>
-      {error && <p className="form-error">{error}</p>}
       <div className="catalog-list">
         {filtered.map((item) => (
-          <div className="catalog-item" key={item.symbol}>
-            <div><strong>{item.name}</strong><span>{item.symbol} · {item.sector}</span></div>
-            <button className={`button ${item.inWatchlist ? 'button-ghost' : 'button-secondary'}`} disabled={busy === item.symbol} onClick={() => toggle(item)}>
-              {item.inWatchlist ? <><Minus size={15} />移出</> : <><Plus size={15} />加入</>}
-            </button>
+          <div className={`catalog-item ${item.enabled ? '' : 'disabled'}`} key={item.symbol}>
+            <div><strong>{item.name}</strong><span>{item.symbol} · {item.sector || '未分类'}{item.enabled ? '' : ' · 已停用'}</span></div>
+            {item.enabled ? (
+              <div className="catalog-actions">
+                <button className="button button-ghost" disabled={busy === item.symbol} onClick={() => setStatus(item, false)} title="从研究列表隐藏，可随时恢复">停用</button>
+                <button className={`button ${item.inWatchlist ? 'button-ghost' : 'button-secondary'}`} disabled={busy === item.symbol} onClick={() => toggle(item)}>
+                  {item.inWatchlist ? <><Minus size={15} />移出</> : <><Plus size={15} />加入</>}
+                </button>
+              </div>
+            ) : (
+              <button className="button button-secondary" disabled={busy === item.symbol} onClick={() => setStatus(item, true)}>恢复</button>
+            )}
           </div>
         ))}
       </div>
@@ -74,7 +200,7 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
   const [price, setPrice] = useState(stock.price);
   const [executedAt, setExecutedAt] = useState(() => new Date().toISOString().slice(0, 10));
   const [planLevel, setPlanLevel] = useState<Exclude<ResearchLevel, 'L0'> | ''>('');
-  const [taxBasis, setTaxBasis] = useState<TaxBasis>('pre_tax');
+  const [taxBasis, setTaxBasis] = useState<TaxBasis>('after_tax');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -121,8 +247,8 @@ export function TradeModal({ stocks, initialSymbol, onClose, onTraded }: { stock
         <div className="field field-full"><span>记账口径</span><div className="side-tabs"><button className={taxBasis === 'pre_tax' ? 'active' : ''} onClick={() => setTaxBasis('pre_tax')}>税前</button><button className={taxBasis === 'after_tax' ? 'active' : ''} onClick={() => setTaxBasis('after_tax')}>税后</button></div></div>
       </div>
       <div className="trade-summary">
-        <span>预计{side === 'buy' ? '支付（含费用）' : '收回（扣费用与税）'}</span>
-        <strong>{money(netAmount)}</strong>
+        <span>{taxBasis === 'pre_tax' ? '记账现金影响（税前毛额，费用税费仅展示）' : side === 'buy' ? '预计支付（含费用）' : '收回（扣费用与税）'}</span>
+        <strong>{money(taxBasis === 'pre_tax' ? gross : netAmount)}</strong>
       </div>
       <div className="trade-fee-line">
         <span>成交金额 {money(gross)}</span>

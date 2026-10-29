@@ -175,6 +175,10 @@ export interface Stock {
   receivedDividend: DividendPayment | null;
   /** 已宣告但尚未到账的分红，不计入可用现金。 */
   pendingDividend: DividendPayment | null;
+  /** 分红历史口径来源：'tencent-fqkline' 表示真实除权数据，null 表示演示种子口径。 */
+  dividendHistorySource: 'tencent-fqkline' | null;
+  /** 真实分红历史的同步时间（ISO 字符串），仅 source 非空时有意义。 */
+  dividendHistorySyncedAt: string | null;
 }
 
 export interface PriceBar {
@@ -189,7 +193,8 @@ export interface PriceBar {
 export interface DividendRecord {
   year: number;
   dividend: number;
-  payoutRatio: number;
+  /** 派息率（%）：真实除权数据不携带，无法从免费源可靠推算，未知时为 null。 */
+  payoutRatio: number | null;
   growth: number;
 }
 
@@ -316,10 +321,10 @@ export interface TradeRecord {
   fee: number;
   /** 卖出印花税；买入为 0。 */
   tax: number;
-  /** 实际现金影响：买入为支出（含费用），卖出为净收回（扣费用与税）。 */
+  /** 记账现金影响：买入为支出，卖出为收回；税前口径为成交金额毛额，税后口径含费用与印花税。 */
   netAmount: number;
   executedAt: string;
-  /** 记账口径：税前 / 税后。 */
+  /** 记账口径：税前=按成交金额毛额记账（费用税费仅展示）；税后=按扣除费用与印花税后的净额记账，缺省为税后。 */
   taxBasis: TaxBasis;
   /** 成交时生效的已保存假设版本，null 表示按默认假设。 */
   assumptionVersion: number | null;
@@ -571,6 +576,22 @@ export interface CatalogItem {
   name: string;
   sector: string;
   inWatchlist: boolean;
+  /** 停用的股票不出现在雷达与观察仓，仅在管理弹窗（includeDisabled）中可见。 */
+  enabled: boolean;
+}
+
+/** 动态添加股票的请求体；名称、行业与日线由服务端从免费行情源拉取。 */
+export interface StockRegistrationInput {
+  /** 6 位代码或带 .SH/.SZ 后缀；服务端归一化为 601318.SH 格式。 */
+  symbol: string;
+  /** 行业覆盖；缺省时从东财 f100 自动获取。 */
+  sector?: string;
+  /** 用户录入的预测每股分红；免费源无可靠预测，缺省为 0（来源标注为用户假设）。 */
+  forecastDividend?: number;
+  /** 买入门槛（要求股息率%），缺省为 5。 */
+  buyThreshold?: number;
+  /** 日线长期未更新（疑似停牌）时，二次确认后仍允许加入。 */
+  confirmSuspended?: boolean;
 }
 
 /** 设置项契约：服务端只接受这里声明的字段，其余字段一律拒绝。 */
@@ -587,7 +608,7 @@ export interface TradeRequest {
   executedAt?: string;
   /** 对应计划档位，缺省或 null 表示无计划的人工记录。 */
   planLevel?: Exclude<ResearchLevel, 'L0'> | null;
-  /** 记账口径：税前 / 税后，缺省为税前。 */
+  /** 记账口径：税前 / 税后，缺省为税后。 */
   taxBasis?: TaxBasis;
 }
 

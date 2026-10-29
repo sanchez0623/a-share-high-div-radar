@@ -72,7 +72,7 @@ export default function PortfolioPage({ data, onTrade }: Props) {
         {portfolio.trades.length > 0 ? (
           <div className="table-scroll"><table className="trade-table"><thead><tr><th>时间</th><th>公司</th><th>方向</th><th>股数</th><th>成交价</th><th>成交金额</th><th>费用</th><th>税</th><th>现金影响</th><th>口径</th><th>计划档位</th><th>假设</th></tr></thead><tbody>{portfolio.trades.map((trade) => <tr key={trade.id}><td>{trade.executedAt}</td><td><strong>{trade.name}</strong><span>{trade.symbol}</span></td><td><span className={`side-badge ${trade.side}`}>{stageLabel(trade.side)}</span></td><td>{number(trade.shares, 0)} 股</td><td>¥{number(trade.price)}</td><td>{money(trade.grossAmount, 0)}</td><td>−{money(trade.fee, 0)}</td><td>{trade.tax > 0 ? `−${money(trade.tax, 0)}` : '—'}</td><td><strong className={trade.netAmount >= 0 ? 'up' : 'down'}>{trade.netAmount >= 0 ? '+' : ''}{money(trade.netAmount, 0)}</strong></td><td>{trade.taxBasis === 'after_tax' ? '税后' : '税前'}</td><td>{trade.planLevel ? <span className="level-chip">{trade.planLevel}</span> : <span className="muted">人工记录</span>}{trade.planTargetPrice ? <small className="muted"> 研究价 ¥{number(trade.planTargetPrice)}</small> : null}</td><td>{trade.assumptionVersion ? `v${trade.assumptionVersion}` : '默认假设'}</td></tr>)}</tbody></table></div>
         ) : <div className="empty-state"><WalletCards size={28} /><h3>账本里还没有成交</h3><p>记录一笔模拟交易后，这里会追溯成交日期、费用与当时的研究假设和计划档位。</p></div>}
-        <p className="panel-footnote">交易记录可追溯到成交时生效的假设版本与计划档位（含该档当时的研究价格），用于复盘计划与成交的偏差。</p>
+        <p className="panel-footnote">交易记录可追溯到成交时生效的假设版本与计划档位（含该档当时的研究价格），用于复盘计划与成交的偏差。记账口径：税前按成交金额毛额记账（费用与印花税仅展示），税后按扣除费用与印花税后的净额记账，缺省为税后。</p>
       </section>
     </div>
   );

@@ -158,7 +158,7 @@ export function PriceChart({ history, stock }: { history: PriceBar[]; stock: Sto
 export function DividendBars({ dividends }: { dividends: DividendRecord[] }) {
   const max = Math.max(...dividends.map((item) => item.dividend));
   return (
-    <div className="dividend-bars" role="img" aria-label="近五年每股分红演示记录">
+    <div className="dividend-bars" role="img" aria-label="历年每股分红记录">
       {dividends.map((item) => (
         <div className="dividend-bar-item" key={item.year}>
           <span className="dividend-bar-value">¥{number(item.dividend)}</span>
@@ -166,7 +166,7 @@ export function DividendBars({ dividends }: { dividends: DividendRecord[] }) {
             <div className="dividend-bar" style={{ height: `${Math.max(12, (item.dividend / max) * 100)}%` }} />
           </div>
           <strong>{item.year}</strong>
-          <span>{item.growth > 0 ? `+${percent(item.growth, 1)}` : '基期'}</span>
+          <span>{item.growth === 0 ? '基期' : percent(item.growth, 1)}</span>
         </div>
       ))}
     </div>

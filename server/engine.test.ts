@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { PlanTier, PriceBar, ResearchLevel } from '../shared/types.ts';
-import { adjustForExDividend, researchPrice } from '../shared/assumptions.ts';
+import { adjustForExDividend, projectedDividendPerShare, researchPrice } from '../shared/assumptions.ts';
 import { buildPlanAllocation } from '../shared/allocation.ts';
 import { isIsoCalendarDate } from '../shared/date.ts';
 import {
@@ -11,6 +11,8 @@ import {
   saveAssumption,
 } from './assumptions.ts';
 import { createDemoState } from './demo-data.ts';
+import { aggregateDividendRecords, applyDividendHistory, computeDividendStreak } from './dividend-history.ts';
+import type { DividendEvent } from './providers/tencent-fqkline.ts';
 import { buildDividendQuality, type DividendQualityInput } from './dividend-quality.ts';
 import { TradeError } from './errors.ts';
 import { calculateIndicators } from './indicators.ts';
@@ -876,14 +878,20 @@ test('未来 12 个月到账与预测年度分红分离：已到账不计入未�
   const portfolio = getPortfolio(state);
   const flows = portfolio.dividendFlows.filter((flow) => flow.symbol === '601318.SH');
 
-  /** 平安预测 2.85 低于同年度已派 2.55 + 待派 0.95：预计部分为负，不得生成流水。 */
-  assert.equal(flows.find((flow) => flow.stage === 'projected'), undefined);
-  const receivedNet = flows.find((flow) => flow.stage === 'received')!.netAmount;
-  const declaredNet = flows.find((flow) => flow.stage === 'declared')!.netAmount;
+  /** 平安预测 2.85 = 同年度已派 1.90 + 待派 0.70 + 未宣告 0.25：三段流水齐备，投影段不再静默省略。 */
+  const received = flows.find((flow) => flow.stage === 'received')!;
+  const declared = flows.find((flow) => flow.stage === 'declared')!;
+  const projected = flows.find((flow) => flow.stage === 'projected')!;
+  assert.equal(received.dividendPerShare, 1.9);
+  assert.equal(declared.dividendPerShare, 0.7);
+  assert.equal(projected.dividendPerShare, 0.25);
 
-  /** 未来 12 个月只含已宣告待收；已到账是过去的现金流，不进入未来口径。 */
-  assert.equal(portfolio.nextTwelveMonthDividendAfterTax, declaredNet);
-  assert.ok(declaredNet < receivedNet);
+  /** 未来 12 个月只含已宣告待收与归属 2026 的预计；已到账是过去的现金流，不进入未来口径。 */
+  assert.equal(
+    portfolio.nextTwelveMonthDividendAfterTax,
+    round(declared.netAmount + projected.netAmount),
+  );
+  assert.ok(declared.netAmount < received.netAmount);
   assert.ok(portfolio.annualDividendAfterTax > portfolio.nextTwelveMonthDividendAfterTax);
 });
 
@@ -1447,6 +1455,79 @@ test('成交日期必须是真实日历日期，非法值直接拒绝且不改�
   assert.equal(traded.trades[0].executedAt, '2026-10-23');
 });
 
+test('记账口径影响现金影响：税前按毛额记账，税后按扣除费用与印花税的净额记账', () => {
+  const preTax = createDemoState();
+  executeTrade(preTax, {
+    symbol: '601318.SH',
+    side: 'buy',
+    shares: 100,
+    price: 48.6,
+    taxBasis: 'pre_tax',
+  });
+  /** 税前口径：现金影响 = 成交金额 4860，佣金 5 + 过户费 0.05 仅展示、不进现金。 */
+  assert.equal(preTax.trades[0].taxBasis, 'pre_tax');
+  assert.equal(preTax.trades[0].netAmount, 4860);
+  assert.equal(preTax.cash, 45_140);
+
+  executeTrade(preTax, {
+    symbol: '601318.SH',
+    side: 'sell',
+    shares: 100,
+    price: 48.6,
+    taxBasis: 'pre_tax',
+  });
+  assert.equal(preTax.trades[0].netAmount, 4860);
+  assert.equal(preTax.cash, 50_000);
+
+  const afterTax = createDemoState();
+  executeTrade(afterTax, { symbol: '601318.SH', side: 'buy', shares: 100, price: 48.6 });
+  /** 缺省为税后：买入现金影响 = 成交金额 + 佣金 5 + 过户费 0.05。 */
+  assert.equal(afterTax.trades[0].taxBasis, 'after_tax');
+  assert.equal(afterTax.trades[0].netAmount, 4865.05);
+  assert.equal(afterTax.cash, 45_134.95);
+
+  executeTrade(afterTax, { symbol: '601318.SH', side: 'sell', shares: 100, price: 48.6 });
+  /** 卖出税后：现金影响 = 成交金额 − 佣金 5 − 过户费 0.05 − 印花税 2.43。 */
+  assert.equal(afterTax.trades[0].netAmount, 4852.52);
+  assert.equal(afterTax.cash, 49_987.47);
+});
+
+test('交易 id 取最大既有序号 + 1：恢复过滤后不与既有 id 撞号', () => {
+  const state = createDemoState();
+  const record = {
+    symbol: '601318.SH',
+    name: '中国平安',
+    side: 'buy' as const,
+    shares: 100,
+    price: 40,
+    grossAmount: 4000,
+    fee: 0,
+    tax: 0,
+    netAmount: 4000,
+    executedAt: '2026-10-01',
+    taxBasis: 'after_tax' as const,
+    assumptionVersion: 1,
+    planLevel: 'L1' as const,
+    planTargetPrice: 40,
+    researchContext: null,
+  };
+  /** 账本只剩 3 条有效记录但最大序号为 4：按 length+1 生成会撞出第二个 trade-4。 */
+  hydratePortfolio(state, {
+    watchlist: ['601318.SH'],
+    cash: 50_000,
+    holdings: [],
+    trades: [
+      { ...record, id: 'trade-4' },
+      { ...record, id: 'trade-2' },
+      { ...record, id: 'trade-1' },
+    ],
+  });
+  executeTrade(state, { symbol: '601318.SH', side: 'buy', shares: 100, price: 40 });
+  const ids = state.trades.map((trade) => trade.id);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.equal(state.trades[0].id, 'trade-5');
+});
+
 test('公开部署必须显式声明并配置访问令牌', () => {
   assert.equal(parsePublicDeployment('true'), true);
   assert.equal(parsePublicDeployment('TRUE'), true);
@@ -1463,4 +1544,106 @@ test('公开部署必须显式声明并配置访问令牌', () => {
   /** 非回环监听无论是否声明公开部署都需要令牌。 */
   assert.match(deploymentAuthError('0.0.0.0', '', false) ?? '', /ACCESS_TOKEN/);
   assert.equal(deploymentAuthError('0.0.0.0', 'token', false), null);
+});
+
+/** 真实 fqkline 事件形态：year=分红年度、perShare=每10股派息（如 10派16.2元 → 16.2）。 */
+function fixtureEvent(year: string, perShare: number, exDate: string): DividendEvent {
+  return { year, perShare, recordDate: exDate, exDate, content: `10派${perShare}元` };
+}
+
+test('真实分红事件按分红年度聚合：每10股换算每股、排除未完结与无效年度', () => {
+  const events = [
+    fixtureEvent('2024', 16.2, '2025-06-30'),
+    fixtureEvent('2024', 9.3, '2024-10-18'),
+    fixtureEvent('2025', 17.5, '2026-06-10'),
+    fixtureEvent('2025', 9.5, '2025-10-24'),
+    /** 当前日历年（2026）尚未完结（年报分红未落地），一律排除。 */
+    fixtureEvent('2026', 9.8, '2026-09-10'),
+    /** 非法年度与零派息事件不入账。 */
+    fixtureEvent('bad', 5, '2020-01-01'),
+    fixtureEvent('2023', 0, '2023-07-01'),
+  ];
+  const records = aggregateDividendRecords(events, 2026);
+  assert.deepEqual(
+    records.map((record) => [record.year, record.dividend, record.growth, record.payoutRatio]),
+    [
+      [2024, 2.55, 0, null],
+      [2025, 2.7, 5.88, null],
+    ],
+  );
+  /** maxYears 只保留最近 N 个完整年度。 */
+  assert.deepEqual(
+    aggregateDividendRecords([...events, fixtureEvent('2023', 15, '2024-07-01')], 2026, 2).map(
+      (record) => record.year,
+    ),
+    [2024, 2025],
+  );
+});
+
+test('连续分红年数从最近完整年度起回数，缺口即中断', () => {
+  const consecutive = [
+    fixtureEvent('2021', 10, '2022-06-20'),
+    fixtureEvent('2022', 10, '2023-06-14'),
+    fixtureEvent('2023', 10, '2024-07-26'),
+    fixtureEvent('2024', 10, '2025-06-30'),
+    fixtureEvent('2025', 10, '2026-06-10'),
+  ];
+  assert.equal(computeDividendStreak(consecutive, 2026), 5);
+  /** 2024 缺口中断：即便 2025 有分红也从 2025 起算。 */
+  const gapped = [
+    fixtureEvent('2025', 10, '2026-06-10'),
+    fixtureEvent('2023', 10, '2024-07-26'),
+    fixtureEvent('2022', 10, '2023-06-14'),
+  ];
+  assert.equal(computeDividendStreak(gapped, 2026), 1);
+  /** 只有当前年度事件（未完结）时无法证明任何完整年度。 */
+  assert.equal(computeDividendStreak([fixtureEvent('2026', 9.8, '2026-09-10')], 2026), 0);
+});
+
+test('applyDividendHistory 替换演示口径并标注来源，无完整年度时不生效', () => {
+  const state = createDemoState();
+  const symbol = '601318.SH';
+  const seedRecords = state.dividends.get(symbol)!;
+  const now = Date.parse('2026-10-29T08:00:00.000Z');
+
+  const applied = applyDividendHistory(
+    state,
+    symbol,
+    [
+      fixtureEvent('2024', 16.2, '2025-06-30'),
+      fixtureEvent('2024', 9.3, '2024-10-18'),
+      fixtureEvent('2025', 17.5, '2026-06-10'),
+      fixtureEvent('2025', 9.5, '2025-10-24'),
+      fixtureEvent('2026', 9.8, '2026-09-10'),
+    ],
+    '2026-10-29T00:54:01.774Z',
+    now,
+  );
+  assert.equal(applied, true);
+  const stock = state.stocks.get(symbol)!;
+  assert.deepEqual(
+    state.dividends.get(symbol)!.map((record) => [record.year, record.dividend]),
+    [
+      [2024, 2.55],
+      [2025, 2.7],
+    ],
+  );
+  assert.equal(stock.dividendStreak, 2);
+  assert.equal(stock.dividendHistorySource, 'tencent-fqkline');
+  assert.equal(stock.dividendHistorySyncedAt, '2026-10-29T00:54:01.774Z');
+  /** 假设说明基于真实增速重建，投影随真实增长外推（2026 基准年不外推）。 */
+  assert.match(stock.dividendForecast.hypothesis, /以每股 2\.85 元为基准/);
+  assert.equal(
+    projectedDividendPerShare(stock.baseDividend, state.dividends.get(symbol)!, 2027, 'base'),
+    3.02,
+  );
+
+  /** 只有当前年度事件时不生效：保持种子口径与未标注状态。 */
+  const untouched = createDemoState();
+  assert.equal(
+    applyDividendHistory(untouched, symbol, [fixtureEvent('2026', 9.8, '2026-09-10')], '2026-10-29T00:00:00.000Z', now),
+    false,
+  );
+  assert.deepEqual(untouched.dividends.get(symbol), seedRecords);
+  assert.equal(untouched.stocks.get(symbol)!.dividendHistorySource, null);
 });

@@ -10,6 +10,7 @@ import type {
   SettingsPatch,
   Stock,
   StockDetailResponse,
+  StockRegistrationInput,
   TradeRequest,
   TradeResponse,
   TradeReviewResponse,
@@ -42,7 +43,8 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   dashboard: () => request<DashboardResponse>('/api/dashboard'),
-  catalog: () => request<CatalogItem[]>('/api/catalog'),
+  catalog: (includeDisabled = false) =>
+    request<CatalogItem[]>(includeDisabled ? '/api/catalog?includeDisabled=1' : '/api/catalog'),
   stock: (symbol: string) => request<StockDetailResponse>(`/api/stocks/${symbol}`),
   /** 拉取指定预算下的加仓分配；budget 省略时用组合可投入现金。 */
   stockWithBudget: (symbol: string, budget?: number) =>
@@ -74,6 +76,34 @@ export const api = {
     }),
   removeWatchlist: (symbol: string) =>
     request<CatalogItem[]>(`/api/watchlist/${symbol}`, { method: 'DELETE' }),
+  /**
+   * 动态添加股票：需要透出 confirmRequired 标记（疑似停牌的二次确认），
+   * 因此不走通用 request，直接解析响应体的附加字段。
+   */
+  addStock: async (input: StockRegistrationInput): Promise<Stock> => {
+    const response = await fetch('/api/stocks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...tokenHeaders() },
+      body: JSON.stringify(input),
+    });
+    const body = (await response.json().catch(() => null)) as
+      | (Partial<Stock> & { error?: string; confirmRequired?: boolean })
+      | { error?: string; confirmRequired?: boolean }
+      | null;
+    if (!response.ok) {
+      const error = new Error(
+        body?.error ?? `请求失败（${response.status}）`,
+      ) as Error & { confirmRequired?: boolean };
+      if (body?.confirmRequired) error.confirmRequired = true;
+      throw error;
+    }
+    return body as Stock;
+  },
+  setStockStatus: (symbol: string, enabled: boolean) =>
+    request<CatalogItem[]>(`/api/stocks/${symbol}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    }),
   verifyRisk: (id: string, input: RiskVerificationInput) =>
     request<RiskMutationResponse>(`/api/risk/${id}/verify`, {
       method: 'POST',

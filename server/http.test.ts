@@ -3,12 +3,15 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import type {
   AssumptionPreviewResponse,
+  CatalogItem,
   DashboardResponse,
   PersistedPortfolio,
   Portfolio,
+  PriceBar,
   RiskMutationResponse,
   Stock,
   StockDetailResponse,
@@ -22,6 +25,9 @@ import { createFileSettingsStore, type SettingsStore } from './settings-store.ts
 import { createFileRiskStore, type RiskStore } from './risk-store.ts';
 import { createFilePortfolioStore, type PortfolioStore } from './portfolio-store.ts';
 import { createDemoState } from './demo-data.ts';
+import { createMemoryStockStore } from './stock-store.ts';
+import { hydrateStocks, type StockRegistrationDeps } from './stock-registration.ts';
+import { collectPortfolioSymbols } from './state-change.ts';
 
 let server: Server;
 let baseUrl = '';
@@ -1086,7 +1092,7 @@ test('模拟交易记录建仓时的假设版本', async () => {
   const trade = portfolio.trades[0];
   assert.ok(trade, '成交后账本应有记录');
   assert.equal(trade.executedAt, '2026-10-23');
-  assert.equal(trade.taxBasis, 'pre_tax');
+  assert.equal(trade.taxBasis, 'after_tax');
   assert.equal(trade.assumptionVersion, 1);
   assert.equal(trade.netAmount, 10_005.1);
   assert.equal(trade.fee, 5.1);
@@ -1450,4 +1456,272 @@ test('假设与风险落盘失败时不升版本、不写核验，恢复后重�
   } finally {
     await new Promise<void>((resolve) => started.server.close(() => resolve()));
   }
+});
+
+// ─── 动态添加 / 停用 / 恢复股票 ─────────────────────────────────────
+
+/** 上海时区今日（YYYY-MM-DD），与服务端停牌判定使用同一时钟。 */
+function shanghaiTodayForTest(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+/** 生成以 lastDate 结尾的连续工作日日线（无调休，仅供测试指标计算）。 */
+function makeTestBars(count: number, lastDate: string, price = 12.5): PriceBar[] {
+  const cursor = Date.parse(`${lastDate}T00:00:00.000Z`);
+  const dates: string[] = [];
+  let offset = 0;
+  while (dates.length < count) {
+    const date = new Date(cursor - offset * 86_400_000);
+    if (date.getUTCDay() !== 0 && date.getUTCDay() !== 6) dates.push(date.toISOString().slice(0, 10));
+    offset += 1;
+  }
+  return dates.reverse().map((date) => ({
+    date,
+    open: price,
+    high: price,
+    low: price,
+    close: price,
+    volume: 1_000_000,
+  }));
+}
+
+/** 假数据源：任何合法代码都返回同一批日线与行情，测试不访问网络。 */
+function fakeStockDataDeps(lastDate = shanghaiTodayForTest()): StockRegistrationDeps {
+  const bars = makeTestBars(140, lastDate);
+  return {
+    fetchBars: async () => ({ bars, name: '测试控股' }),
+    fetchQuote: async (symbol) => ({
+      symbol,
+      name: '测试控股',
+      price: 12.5,
+      prevClose: 12.4,
+      open: 12.4,
+      high: 12.6,
+      low: 12.3,
+      volume: 1_000_000,
+      amount: 12_500_000,
+      changePct: 0.81,
+      quoteTime: '2026-10-29T15:00:00+08:00',
+      fetchedAt: '2026-10-29T07:00:00.000Z',
+      source: 'tencent',
+      quoteTimeReliable: true,
+      pe: 9.9,
+      pb: 1.1,
+    }),
+    fetchSector: async () => '测试行业',
+  };
+}
+
+/** 测试写入的日线缓存文件是 server/.data 下的运行时文件（已 gitignore），结束后删除以免污染。 */
+function cleanupTestBars(symbols: string[]): void {
+  for (const symbol of symbols) {
+    rmSync(fileURLToPath(new URL(`./.data/bars/${symbol}.json`, import.meta.url)), { force: true });
+  }
+}
+
+test('POST /api/stocks 动态添加股票：拉数入仓、快照派生、观察仓与目录自动纳入', async () => {
+  const started = await startServer(undefined, undefined, undefined, {
+    stockStore: createMemoryStockStore(),
+    stockDataDeps: fakeStockDataDeps(),
+  });
+
+  try {
+    const response = await fetch(`${started.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '600999', forecastDividend: 0.5 }),
+    });
+    assert.equal(response.status, 200);
+    const stock = (await response.json()) as Stock;
+    assert.equal(stock.symbol, '600999.SH');
+    assert.equal(stock.name, '测试控股');
+    assert.equal(stock.sector, '测试行业');
+    assert.equal(stock.forecastDividend, 0.5);
+    assert.equal(stock.pe, 9.9);
+    assert.equal(stock.dividendForecast.source, 'assumption');
+    assert.ok(stock.sparkline.length > 0, '添加后快照应携带技术指标派生数据');
+
+    const dashboardResponse = await fetch(`${started.baseUrl}/api/dashboard`);
+    const dashboard = (await dashboardResponse.json()) as DashboardResponse;
+    assert.ok(dashboard.stocks.some((item) => item.symbol === '600999.SH'), '新股票应自动进入观察仓雷达');
+
+    const catalog = (await (
+      await fetch(`${started.baseUrl}/api/catalog?includeDisabled=1`)
+    ).json()) as CatalogItem[];
+    const item = catalog.find((entry) => entry.symbol === '600999.SH');
+    assert.equal(item?.enabled, true);
+    assert.equal(item?.inWatchlist, true);
+
+    /** 重复添加、非法代码与B股一律拒绝。 */
+    const duplicate = await fetch(`${started.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '600999.SH' }),
+    });
+    assert.equal(duplicate.status, 409);
+
+    const invalid = await fetch(`${started.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: 'abcdef' }),
+    });
+    assert.equal(invalid.status, 400);
+
+    const bShare = await fetch(`${started.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '900901.SH' }),
+    });
+    assert.equal(bShare.status, 400);
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
+    cleanupTestBars(['600999.SH']);
+  }
+});
+
+test('疑似长期停牌的股票返回 confirmRequired，确认后仍可加入', async () => {
+  const started = await startServer(undefined, undefined, undefined, {
+    stockStore: createMemoryStockStore(),
+    stockDataDeps: fakeStockDataDeps('2026-09-15'),
+  });
+
+  try {
+    const first = await fetch(`${started.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '600998.SH', forecastDividend: 0.3 }),
+    });
+    assert.equal(first.status, 409);
+    const body = (await first.json()) as { error: string; confirmRequired?: boolean };
+    assert.equal(body.confirmRequired, true);
+
+    const confirmed = await fetch(`${started.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '600998.SH', forecastDividend: 0.3, confirmSuspended: true }),
+    });
+    assert.equal(confirmed.status, 200);
+    const stock = (await confirmed.json()) as Stock;
+    assert.equal(stock.symbol, '600998.SH');
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
+    cleanupTestBars(['600998.SH']);
+  }
+});
+
+test('停用与恢复：停用后从雷达隐藏且观察仓拒绝，持仓大于0禁止停用', async () => {
+  const started = await startServer(undefined, undefined, undefined, {
+    stockStore: createMemoryStockStore(),
+    stockDataDeps: fakeStockDataDeps(),
+  });
+  const postJson = (path: string, body: unknown) =>
+    fetch(`${started.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  const patchStatus = (symbol: string, enabled: boolean) =>
+    fetch(`${started.baseUrl}/api/stocks/${symbol}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+
+  try {
+    const added = await postJson('/api/stocks', { symbol: '600999.SH', forecastDividend: 0.5 });
+    assert.equal(added.status, 200);
+
+    /** 停用无持仓的种子股票。 */
+    const disableSeed = await patchStatus('601088.SH', false);
+    assert.equal(disableSeed.status, 200);
+    const afterDisable = (await disableSeed.json()) as CatalogItem[];
+    assert.equal(afterDisable.find((item) => item.symbol === '601088.SH')?.enabled, false);
+
+    const disabledDetail = await fetch(`${started.baseUrl}/api/stocks/601088.SH`);
+    assert.equal(disabledDetail.status, 404, '停用后详情接口必须拒绝');
+
+    const reAdd = await postJson('/api/watchlist', { symbol: '601088.SH' });
+    assert.equal(reAdd.status, 400, '停用中的股票不能加入观察仓');
+
+    /** 恢复：详情重新可用，停用记录从 stocks.json 清除。 */
+    const enableSeed = await patchStatus('601088.SH', true);
+    assert.equal(enableSeed.status, 200);
+    const detail = await fetch(`${started.baseUrl}/api/stocks/601088.SH`);
+    assert.equal(detail.status, 200);
+
+    /** 持仓大于 0 的股票不允许停用。 */
+    const disableHeld = await patchStatus('601318.SH', false);
+    assert.equal(disableHeld.status, 409);
+
+    /** 停用自定义股票：状态目录可见，详情接口拒绝，恢复后回来。 */
+    const disableCustom = await patchStatus('600999.SH', false);
+    assert.equal(disableCustom.status, 200);
+    assert.equal((await fetch(`${started.baseUrl}/api/stocks/600999.SH`)).status, 404);
+    const catalog = (await (
+      await fetch(`${started.baseUrl}/api/catalog?includeDisabled=1`)
+    ).json()) as CatalogItem[];
+    assert.equal(catalog.find((item) => item.symbol === '600999.SH')?.enabled, false);
+
+    const enableCustom = await patchStatus('600999.SH', true);
+    assert.equal(enableCustom.status, 200);
+    const restored = (await (await fetch(`${started.baseUrl}/api/stocks/600999.SH`)).json()) as StockDetailResponse;
+    assert.equal(restored.stock.forecastDividend, 0.5, '恢复后研究口径保持停用前的记录');
+
+    /** 缺少 enabled 字段直接拒绝。 */
+    const badBody = await fetch(`${started.baseUrl}/api/stocks/600999.SH/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(badBody.status, 400);
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
+    cleanupTestBars(['600999.SH']);
+  }
+});
+
+test('hydrateStocks 启动恢复：自定义股票重建，停用记录从演示全集拆除', () => {
+  const state = createDemoState();
+  hydrateStocks(state, {
+    version: 1,
+    stocks: [
+      {
+        symbol: '601998.SH',
+        name: '测试银行',
+        kind: 'custom',
+        disabled: false,
+        sector: '银行',
+        addedAt: '2026-10-29',
+        forecastDividend: 0.3,
+        buyThreshold: 5,
+        pe: null,
+        pb: null,
+        price: 7,
+      },
+      {
+        symbol: '601088.SH',
+        name: '中国神华',
+        kind: 'seed',
+        disabled: true,
+        sector: '',
+        addedAt: '',
+        forecastDividend: 0,
+        buyThreshold: 0,
+        pe: null,
+        pb: null,
+        price: 0,
+      },
+    ],
+  });
+
+  assert.ok(state.stocks.has('601998.SH'), '启用的自定义股票必须重建');
+  assert.ok(state.histories.get('601998.SH')!.length >= 20, '日线缓存缺失时用占位序列兜底');
+  assert.equal(state.stocks.get('601998.SH')!.forecastDividend, 0.3);
+  assert.ok(!state.stocks.has('601088.SH'), '停用的种子必须从研究全集拆除');
+  assert.ok(!collectPortfolioSymbols(state).includes('601088.SH'));
 });

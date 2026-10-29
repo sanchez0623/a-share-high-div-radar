@@ -4,7 +4,7 @@ import { SectionHeading } from '../components/UI.tsx';
 const layers = [
   { index: '01', title: '数据接入层', subtitle: 'PROVIDER ADAPTER', text: '统一行情、财报、分红与公告的数据口径。当前使用显式演示适配器，未来可替换为 iFinD / Tushare，不污染领域逻辑。', icon: Database },
   { index: '02', title: '指标与研究层', subtitle: 'RESEARCH ENGINE', text: '计算 MA20、布林带、%B、ATR 与预测股息率；六项信号独立判断，评分只用于研究排序。', icon: Workflow },
-  { index: '03', title: '决策编排层', subtitle: 'DECISION ORCHESTRATION', text: '按估值 → 分红质量 → 超跌 → 趋势 → 风险 → 预算生成 L0–L3 研究等级；质量不达标或含一次性分红时封顶 L1，风险按严重度矩阵阻断，24 小时冷却只抑制重复提醒。', icon: GitBranch },
+  { index: '03', title: '决策编排层', subtitle: 'DECISION ORCHESTRATION', text: '按股息率门槛 × 布林超跌派生 L0–L3 研究等级；分红质量不达标或含一次性分红时封顶 L1，风险按严重度矩阵阻断，24 小时冷却只抑制重复提醒。', icon: GitBranch },
   { index: '04', title: '人工复核层', subtitle: 'HUMAN-IN-THE-LOOP', text: '风险原文、核验记录与有效期由人逐条登记；股票级闸门由全部风险事件派生，高风险未关闭时全部等级阻断。', icon: ShieldCheck },
 ];
 

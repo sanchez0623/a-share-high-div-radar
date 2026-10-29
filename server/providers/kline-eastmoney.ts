@@ -64,8 +64,11 @@ function parseKline(row: string): PriceBar | null {
   };
 }
 
-/** 拉取单只的前复权日线（按日期升序，最后一根为最新交易日）。 */
-export async function fetchDailyBars(symbol: string, options: DailyBarOptions = {}): Promise<PriceBar[]> {
+/** 拉取单只的前复权日线（按日期升序，最后一根为最新交易日），并捎带数据源返回的证券简称。 */
+export async function fetchDailyBarsDetailed(
+  symbol: string,
+  options: DailyBarOptions = {},
+): Promise<{ bars: PriceBar[]; name: string }> {
   const normalized = normalizeSymbol(symbol);
   const secid = `${normalized.endsWith('.SH') ? 1 : 0}.${normalized.slice(0, 6)}`;
   const url =
@@ -78,7 +81,12 @@ export async function fetchDailyBars(symbol: string, options: DailyBarOptions = 
   if (bars.length === 0) {
     throw new Error(`东财日线返回为空：${normalized}`);
   }
-  return bars;
+  return { bars, name: (payload.data?.name ?? '').trim() };
+}
+
+/** 拉取单只的前复权日线（按日期升序，最后一根为最新交易日）。 */
+export async function fetchDailyBars(symbol: string, options: DailyBarOptions = {}): Promise<PriceBar[]> {
+  return (await fetchDailyBarsDetailed(symbol, options)).bars;
 }
 
 /** 批量拉取多只日线；单只失败不拖垮整批，由调用方根据返回的 errors 决定降级。 */

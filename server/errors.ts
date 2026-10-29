@@ -44,3 +44,16 @@ export class SettingsError extends Error {
     this.name = 'SettingsError';
   }
 }
+
+/** 动态添加/停用股票的校验与数据源错误；status 决定 HTTP 状态码。 */
+export class StockError extends Error {
+  constructor(
+    message: string,
+    readonly status: 400 | 409 | 503 = 400,
+    /** true 表示「疑似停牌」等待二次确认，响应体会携带 confirmRequired 标记。 */
+    readonly confirmRequired = false,
+  ) {
+    super(message);
+    this.name = 'StockError';
+  }
+}

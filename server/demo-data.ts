@@ -85,8 +85,9 @@ const STOCK_SEEDS: StockSeed[] = [
       debtRatio: 91.4,
       oneOff: false,
     },
-    exDividend: { exDate: '2026-09-10', payDate: '2026-10-16', dividendPerShare: 2.55 },
-    pendingDividend: { exDate: '2026-10-15', payDate: '2026-11-20', dividendPerShare: 0.95 },
+    /** 2026 年内实施进度：中期已派 1.90 + 末期已宣告待收 0.70，剩余 0.25 尚未宣告，与全年预测 2.85 一致。 */
+    exDividend: { exDate: '2026-09-10', payDate: '2026-10-16', dividendPerShare: 1.9 },
+    pendingDividend: { exDate: '2026-10-15', payDate: '2026-11-20', dividendPerShare: 0.7 },
     valuationBasis: { pe: 'ttm', roe: 'annual' },
   },
   {
@@ -417,6 +418,100 @@ function buildRiskEvents(): RiskEventRecord[] {
   });
 }
 
+/** 一只种子股的完整研究口径：供 createDemoState 与「停用后恢复」共用。 */
+export interface SeedStockEntry {
+  seed: StockSeed;
+  /** analyzeStock 的输入口径（价格、指标与等级等派生字段会被覆盖）。 */
+  initial: Stock;
+  history: PriceBar[];
+  dividends: DividendRecord[];
+  qualityInput: DividendQualityInput;
+}
+
+/** 构建单只种子股的研究口径；symbol 不在种子列表时返回 null。 */
+export function buildSeedEntry(symbol: string, now = Date.now()): SeedStockEntry | null {
+  const seed = STOCK_SEEDS.find((item) => item.symbol === symbol);
+  if (!seed) return null;
+
+  const history = buildMarketHistory(seed);
+  const dividends = buildDividendHistory(seed);
+  const previousClose = history[history.length - 2].close;
+  const changePct = round((seed.price / previousClose - 1) * 100);
+  /** 持仓与风险闸门由 analyzeStock 的入参覆盖，这里只需占位。 */
+  const initial: Stock = {
+    symbol: seed.symbol,
+    name: seed.name,
+    market: seed.market,
+    sector: seed.sector,
+    price: seed.price,
+    changePct,
+    baseDividend: seed.forecastDividend,
+    forecastDividend: seed.forecastDividend,
+    dividendYield: 0,
+    buyThreshold: seed.buyThreshold,
+    assumptionVersion: 0,
+    payoutRatio: seed.payoutRatio,
+    dividendStreak: seed.dividendStreak,
+    pe: seed.pe,
+    pb: seed.pb,
+    roe: seed.roe,
+    holdingShares: 0,
+    holdingCost: 0,
+    updatedAt: AS_OF,
+    dataMode: 'demo',
+    score: 0,
+    level: 'L0',
+    action: '继续观察',
+    summary: '',
+    percentB: 0,
+    bollUpper: 0,
+    bollMiddle: 0,
+    bollLower: 0,
+    atr: 0,
+    ma20: 0,
+    signals: [],
+    sparkline: [],
+    riskGate: deriveRiskGate([], seed.symbol, now),
+    dividendForecast: {
+      year: FORECAST_BASE_YEAR,
+      scenario: 'base',
+      dividendPerShare: seed.forecastDividend,
+      ...seed.forecast,
+      hypothesis: buildForecastHypothesis(
+        seed.forecastDividend,
+        dividends,
+        FORECAST_BASE_YEAR,
+        'base',
+      ),
+    },
+    baseForecast: { ...seed.forecast },
+    dividendQuality: buildDividendQuality(
+      qualityInputOf(seed),
+      seed.forecastDividend,
+      FORECAST_BASE_YEAR,
+    ),
+    valuationBasis: { ...seed.valuationBasis },
+    marketData: {
+      quoteTime: DATA_META.quoteTime,
+      priceAdjustment: DATA_META.priceAdjustment,
+      indicatorAdjustment: DATA_META.indicatorAdjustment,
+      lastExDate: seed.exDividend.exDate,
+    },
+    /** 已到账与已宣告待收各记一条，避免把待收现金当成可用资金。 */
+    receivedDividend: seed.exDividend,
+    pendingDividend: seed.pendingDividend,
+    /** 种子默认演示口径；启动装配读到真实分红事件缓存时由 applyDividendHistory 覆盖。 */
+    dividendHistorySource: null,
+    dividendHistorySyncedAt: null,
+  };
+  return { seed, initial, history, dividends, qualityInput: qualityInputOf(seed) };
+}
+
+/** 是否为内置演示股票（种子全集），用于停用/恢复的分支处理。 */
+export function isSeedStock(symbol: string): boolean {
+  return STOCK_SEEDS.some((item) => item.symbol === symbol);
+}
+
 /** 演示初始状态：写入事实数据，派生结论由 snapshot.ts 现算。 */
 export function createDemoState(now = Date.now()): DemoState {
   const state: DemoState = {
@@ -439,81 +534,15 @@ export function createDemoState(now = Date.now()): DemoState {
   };
 
   for (const seed of STOCK_SEEDS) {
-    const history = buildMarketHistory(seed);
-    const dividends = buildDividendHistory(seed);
+    const entry = buildSeedEntry(seed.symbol, now)!;
     const holding = state.holdings.get(seed.symbol)!;
-    const previousClose = history[history.length - 2].close;
-    const changePct = round((seed.price / previousClose - 1) * 100);
-    const initial: Stock = {
-      symbol: seed.symbol,
-      name: seed.name,
-      market: seed.market,
-      sector: seed.sector,
-      price: seed.price,
-      changePct,
-      baseDividend: seed.forecastDividend,
-      forecastDividend: seed.forecastDividend,
-      dividendYield: 0,
-      buyThreshold: seed.buyThreshold,
-      assumptionVersion: 0,
-      payoutRatio: seed.payoutRatio,
-      dividendStreak: seed.dividendStreak,
-      pe: seed.pe,
-      pb: seed.pb,
-      roe: seed.roe,
-      holdingShares: holding.shares,
-      holdingCost: holding.cost,
-      updatedAt: AS_OF,
-      dataMode: 'demo',
-      score: 0,
-      level: 'L0',
-      action: '继续观察',
-      summary: '',
-      percentB: 0,
-      bollUpper: 0,
-      bollMiddle: 0,
-      bollLower: 0,
-      atr: 0,
-      ma20: 0,
-      signals: [],
-      sparkline: [],
-      riskGate: deriveRiskGate(state.risks, seed.symbol, now),
-      dividendForecast: {
-        year: FORECAST_BASE_YEAR,
-        scenario: 'base',
-        dividendPerShare: seed.forecastDividend,
-        ...seed.forecast,
-        hypothesis: buildForecastHypothesis(
-          seed.forecastDividend,
-          dividends,
-          FORECAST_BASE_YEAR,
-          'base',
-        ),
-      },
-      baseForecast: { ...seed.forecast },
-      dividendQuality: buildDividendQuality(
-        qualityInputOf(seed),
-        seed.forecastDividend,
-        FORECAST_BASE_YEAR,
-      ),
-      valuationBasis: { ...seed.valuationBasis },
-      marketData: {
-        quoteTime: DATA_META.quoteTime,
-        priceAdjustment: DATA_META.priceAdjustment,
-        indicatorAdjustment: DATA_META.indicatorAdjustment,
-        lastExDate: seed.exDividend.exDate,
-      },
-      /** 已到账与已宣告待收各记一条，避免把待收现金当成可用资金。 */
-      receivedDividend: seed.exDividend,
-      pendingDividend: seed.pendingDividend,
-    };
-    state.histories.set(seed.symbol, history);
-    state.dividends.set(seed.symbol, dividends);
+    state.histories.set(seed.symbol, entry.history);
+    state.dividends.set(seed.symbol, entry.dividends);
     state.stocks.set(
       seed.symbol,
       analyzeStock({
-        stock: initial,
-        history,
+        stock: entry.initial,
+        history: entry.history,
         availableCash: state.cash,
         riskGate: deriveRiskGate(state.risks, seed.symbol, now),
         holding,

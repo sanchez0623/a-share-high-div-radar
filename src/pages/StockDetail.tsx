@@ -97,7 +97,11 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
             <p><span>公告日期</span><strong>{stock.dividendForecast.announcementDate ?? '无（非公告口径）'}</strong></p>
             <p className="wide"><span>预测假设</span><strong>{stock.dividendForecast.hypothesis}</strong></p>
           </div>
-          <p className="panel-footnote">历史记录为演示口径；预测分红需结合最新财报、派息政策与现金流人工确认。</p>
+          <p className="panel-footnote">
+            {stock.dividendHistorySource === 'tencent-fqkline'
+              ? `历史分红来自腾讯行情除权数据（截至 ${stock.dividendHistorySyncedAt?.slice(0, 10) ?? '未知'}，统计窗口近15年，按分红年度汇总，派息率未提供）；预测分红需结合最新财报、派息政策与现金流人工确认。`
+              : '历史记录为演示口径；预测分红需结合最新财报、派息政策与现金流人工确认。'}
+          </p>
         </div>
         <div className="panel next-step-panel">
           <span className="eyebrow light">NEXT RESEARCH LEVEL</span>

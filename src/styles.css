@@ -719,6 +719,18 @@ table { width: 100%; border-collapse: collapse; }
 .level-chip { display: inline-block; padding: 3px 7px; color: var(--ink); border: 1px solid var(--line-dark); border-radius: 3px; font-family: var(--mono); font-size: 9px; font-weight: 700; }
 .muted { color: #9aa49d; }
 .form-error { margin-top: 12px; padding: 10px; color: #a24e38; background: var(--coral-soft); border-radius: 4px; font-size: 10px; }
+.form-success { margin-top: 12px; padding: 10px; color: #3e6b4f; background: var(--sage-soft); border-radius: 4px; font-size: 10px; }
+
+/* 管理观察仓 · 动态添加新股票 */
+.add-stock { display: flex; flex-direction: column; gap: 7px; margin-bottom: 14px; }
+.add-stock-row { display: flex; gap: 8px; }
+.add-stock-row .add-stock-code { flex: 1; }
+.add-stock-forecast { width: 150px; padding: 0 11px; color: var(--ink); background: var(--surface); border: 1px solid var(--line-dark); border-radius: 4px; outline: 0; font-size: 11px; }
+.add-stock-forecast:focus { border-color: var(--ink-soft); }
+.add-stock-hint { color: #8a968e; font-size: 9px; line-height: 1.5; }
+.confirm-actions { display: flex; gap: 8px; margin-top: 8px; }
+.catalog-item.disabled { opacity: 0.45; }
+.catalog-actions { display: flex; align-items: center; gap: 6px; }
 .checklist-preview { padding: 20px; background: var(--surface); border: 1px solid var(--line); }
 .checklist-stock { display: flex; align-items: center; gap: 10px; padding-bottom: 16px; border-bottom: 2px solid var(--ink); }
 .checklist-stock strong { font-family: var(--serif); font-size: 19px; }

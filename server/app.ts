@@ -14,6 +14,7 @@ import type {
   RiskVerificationInput,
   Stock,
   StockDetailResponse,
+  StockRegistrationInput,
   TradeRequest,
   TradeResponse,
 } from '../shared/types.ts';
@@ -25,7 +26,8 @@ import {
   saveAssumption,
 } from './assumptions.ts';
 import { AS_OF, DATA_META, DATA_NOTICE, getDataNotice } from './config.ts';
-import { AssumptionError, RiskError, SettingsError, TradeError } from './errors.ts';
+import { AssumptionError, RiskError, SettingsError, StockError, TradeError } from './errors.ts';
+import { isSeedStock } from './demo-data.ts';
 import { buildAllocation, executeTrade, getPortfolio, hydratePortfolio } from './portfolio.ts';
 import { buildResearchPlan } from './research.ts';
 import { getRiskEvents, RISK_POLICY } from './risk-model.ts';
@@ -35,6 +37,21 @@ import { collectSettings, hydrateSettings, updateStockSettings } from './setting
 import { createMemorySettingsStore, type SettingsStore } from './settings-store.ts';
 import { getStockSnapshot } from './snapshot.ts';
 import type { QuoteService } from './quote-service.ts';
+import { saveBars } from './bar-store.ts';
+import {
+  defaultStockDataDeps,
+  parseStockRegistrationInput,
+  prepareNewStock,
+  prepareRestore,
+  registerStockIntoState,
+  removeStockFromState,
+  type StockRegistrationDeps,
+} from './stock-registration.ts';
+import {
+  createMemoryStockStore,
+  type PersistedStockRecord,
+  type StockStore,
+} from './stock-store.ts';
 import { commitPortfolioChange, commitResearchChange, collectPortfolioSymbols } from './state-change.ts';
 import { reviewTrades } from './trade-review.ts';
 import { cloneDemoState, commitDemoState, type DemoState } from './state.ts';
@@ -63,6 +80,10 @@ export interface AppOptions {
   quoteService?: QuoteService;
   /** 设置项（买入门槛）的持久化存储；缺省仅写入内存。 */
   settingsStore?: SettingsStore;
+  /** 动态添加股票的落盘存储；缺省仅写入内存（启动装配由 index.ts 在 createApp 之前完成）。 */
+  stockStore?: StockStore;
+  /** 添加/恢复股票的数据源；缺省走东财日线 + 腾讯行情，测试注入假实现。 */
+  stockDataDeps?: StockRegistrationDeps;
 }
 
 /** /api/quotes 单次请求的标的数上限；观察仓远小于该值，仅防滥用。 */
@@ -78,6 +99,8 @@ export function createApp(
   const app = express();
   const extraOrigins = options.allowedOrigins ?? [];
   const settingsStore = options.settingsStore ?? createMemorySettingsStore();
+  const stockStore = options.stockStore ?? createMemoryStockStore();
+  const stockDataDeps = options.stockDataDeps ?? defaultStockDataDeps;
   app.disable('x-powered-by');
   /** 先拦来源再交给 cors：预检请求同样按白名单拒绝，浏览器拿不到任何响应头。 */
   app.use('/api', createOriginGuard(extraOrigins));
@@ -161,13 +184,43 @@ export function createApp(
     };
   }
 
-  function getCatalog(target: DemoState): CatalogItem[] {
-    return Array.from(target.stocks.values(), (stock) => ({
+  function getCatalog(target: DemoState, includeDisabled = false): CatalogItem[] {
+    const items: CatalogItem[] = Array.from(target.stocks.values(), (stock) => ({
       symbol: stock.symbol,
       name: stock.name,
       sector: stock.sector,
       inWatchlist: target.watchlist.has(stock.symbol),
+      enabled: true,
     }));
+    if (!includeDisabled) return items;
+    /** 停用记录不在 state 里：从 stocks.json 读取，让管理弹窗能看到并恢复它们。 */
+    const disabled = (stockStore.load()?.stocks ?? [])
+      .filter((record) => record.disabled && !target.stocks.has(record.symbol))
+      .map(
+        (record): CatalogItem => ({
+          symbol: record.symbol,
+          name: record.name,
+          sector: record.sector,
+          inWatchlist: false,
+          enabled: false,
+        }),
+      );
+    return [...items, ...disabled];
+  }
+
+  /** stocks.json 的记录级更新入口：load → 变更 → save（单进程内无并发写）。 */
+  function mutateStockRecords(
+    mutate: (records: PersistedStockRecord[]) => PersistedStockRecord[],
+  ): void {
+    const current = stockStore.load() ?? { version: 1 as const, stocks: [] };
+    stockStore.save({ version: 1, stocks: mutate(current.stocks) });
+  }
+
+  function upsertStockRecord(record: PersistedStockRecord): void {
+    mutateStockRecords((records) => [
+      ...records.filter((item) => item.symbol !== record.symbol),
+      record,
+    ]);
   }
 
   app.get('/api/health', (_req, res) => {
@@ -196,9 +249,153 @@ export function createApp(
     res.json(response);
   });
 
-  app.get('/api/catalog', (_req, res) => {
-    const response: CatalogItem[] = getCatalog(state);
-    res.json(response);
+  app.get('/api/catalog', (req, res) => {
+    const includeDisabled = req.query.includeDisabled === '1';
+    res.json(getCatalog(state, includeDisabled));
+  });
+
+  /**
+   * 动态添加股票：校验 → 拉取日线与行情 → 注入状态 → 落盘 → 入观察仓。
+   * 网络拉取在写事务之前完成；runWrite 内的重复检查保证并发注册只成功一次。
+   */
+  app.post('/api/stocks', async (req, res) => {
+    let input: StockRegistrationInput;
+    try {
+      input = parseStockRegistrationInput(req.body);
+    } catch (error) {
+      if (error instanceof StockError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
+    if (state.stocks.has(input.symbol)) {
+      res.status(409).json({ error: '该股票已在研究列表中' });
+      return;
+    }
+    try {
+      const prepared = await prepareNewStock(input, stockDataDeps);
+      const stock = runWrite(
+        (draft) => {
+          registerStockIntoState(draft, prepared, { watchlist: true });
+          return getStockSnapshot(draft, input.symbol);
+        },
+        () => {
+          /** 日线先落盘：stocks.json 写失败时只是孤立缓存文件，反过来则会出现无历史的幽灵股票。 */
+          saveBars(input.symbol, prepared.bars);
+          upsertStockRecord(prepared.record);
+        },
+      );
+      res.json(stock);
+    } catch (error) {
+      if (error instanceof StockError) {
+        res
+          .status(error.status)
+          .json(error.confirmRequired ? { error: error.message, confirmRequired: true } : { error: error.message });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  /**
+   * 停用 / 恢复（软删除）：停用后从雷达、观察仓与行情轮询中隐藏；
+   * 持仓大于 0 的股票不允许停用，避免账本与交易追溯悬空。
+   */
+  app.patch('/api/stocks/:symbol/status', async (req, res) => {
+    const symbol = normalizeSymbol(req.params.symbol);
+    const enabled = (req.body as { enabled?: unknown } | undefined)?.enabled;
+    if (typeof enabled !== 'boolean') {
+      res.status(400).json({ error: 'enabled 必须为布尔值' });
+      return;
+    }
+
+    try {
+      if (!enabled) {
+        if (!state.stocks.has(symbol)) {
+          res.status(404).json({ error: '股票代码不存在' });
+          return;
+        }
+        if ((state.holdings.get(symbol)?.shares ?? 0) > 0) {
+          res.status(409).json({ error: '持仓大于0，请先清仓后再停用' });
+          return;
+        }
+        const result = runWrite(
+          (draft) => {
+            const stock = draft.stocks.get(symbol)!;
+            const existing = stockStore
+              .load()
+              ?.stocks.find((item) => item.symbol === symbol && item.kind === 'custom' && !item.disabled);
+            /** 自定义股票保留完整定义以便恢复；种子只记录「被停用了」。 */
+            const record: PersistedStockRecord = existing
+              ? { ...existing, disabled: true }
+              : {
+                  symbol,
+                  name: stock.name,
+                  kind: isSeedStock(symbol) ? 'seed' : 'custom',
+                  disabled: true,
+                  sector: stock.sector,
+                  addedAt: '',
+                  forecastDividend: stock.forecastDividend,
+                  buyThreshold: stock.buyThreshold,
+                  pe: stock.pe > 0 ? stock.pe : null,
+                  pb: stock.pb > 0 ? stock.pb : null,
+                  price: stock.price,
+                };
+            removeStockFromState(draft, symbol);
+            /** 停用记录此刻尚未落盘：响应目录直接拼入刚停用的条目，前端可就地置灰。 */
+            const disabledItem: CatalogItem = {
+              symbol,
+              name: stock.name,
+              sector: stock.sector,
+              inWatchlist: false,
+              enabled: false,
+            };
+            return { catalog: [...getCatalog(draft, true), disabledItem], record };
+          },
+          (_draft, result) => upsertStockRecord(result.record),
+        );
+        res.json(result.catalog);
+        return;
+      }
+
+      /** 恢复：停用的股票不在 state 里，只能从 stocks.json 找到记录。 */
+      if (state.stocks.has(symbol)) {
+        res.status(409).json({ error: '该股票未处于停用状态' });
+        return;
+      }
+      const record = stockStore.load()?.stocks.find((item) => item.symbol === symbol && item.disabled);
+      if (!record) {
+        res.status(404).json({ error: '停用记录不存在' });
+        return;
+      }
+      const restored = await prepareRestore(record);
+      const catalog = runWrite(
+        (draft) => {
+          registerStockIntoState(draft, restored, { watchlist: false });
+          /** 停用前保存的分红假设保持生效：恢复后按原版本重挂到研究口径上。 */
+          const saved = draft.assumptions.get(symbol);
+          if (saved) hydrateAssumptions(draft, [saved]);
+          return getCatalog(draft, true);
+        },
+        () => {
+          if (restored.freshBars) saveBars(symbol, restored.bars);
+          if (record.kind === 'seed') {
+            /** 种子定义在代码里：恢复后清除停用记录，避免 stocks.json 无限累积。 */
+            mutateStockRecords((records) => records.filter((item) => item.symbol !== symbol));
+          } else {
+            upsertStockRecord({ ...record, disabled: false });
+          }
+        },
+      );
+      res.json(catalog);
+    } catch (error) {
+      if (error instanceof StockError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.get('/api/stocks/:symbol', (req, res) => {

@@ -117,8 +117,12 @@ export default function Dashboard({ data, onSelect, onManage, liveQuotes }: Prop
         />
 
         <div className="stock-list">
-          {stocks.map((stock, index) => (
-            <button className="stock-row" key={stock.symbol} onClick={() => onSelect(stock.symbol)} style={{ '--row-index': index } as React.CSSProperties}>
+          {stocks.map((stock, index) => {
+            const quote = liveQuotes.quotes.get(stock.symbol);
+            const price = quote?.price ?? stock.price;
+            const changePct = quote?.changePct ?? stock.changePct;
+            return (
+              <button className="stock-row" key={stock.symbol} onClick={() => onSelect(stock.symbol)} style={{ '--row-index': index } as React.CSSProperties}>
               <div className="stock-identity">
                 <div className="stock-order">{String(index + 1).padStart(2, '0')}</div>
                 <div>
@@ -127,16 +131,23 @@ export default function Dashboard({ data, onSelect, onManage, liveQuotes }: Prop
                 </div>
               </div>
               <div className="stock-quote">
-                <span>最近收盘</span>
-                <strong>¥{number(stock.price)}</strong>
-                <small className={stock.changePct >= 0 ? 'up' : 'down'}>{stock.changePct >= 0 ? '+' : ''}{percent(stock.changePct)}</small>
+                <span>
+                  {quote ? (
+                    <>
+                      <i className={`quote-dot ${quote.stale ? 'quote-dot--stale' : 'quote-dot--live'}`} />
+                      实时{quote.stale ? ' · 延迟' : ''}
+                    </>
+                  ) : '最近收盘'}
+                </span>
+                <strong>¥{number(price)}</strong>
+                <small className={changePct >= 0 ? 'up' : 'down'}>{changePct >= 0 ? '+' : ''}{percent(changePct)}</small>
               </div>
               <div className="stock-yield">
                 <span>预测股息率</span>
                 <strong>{percent(stock.dividendYield)}</strong>
                 <small>门槛 {percent(stock.buyThreshold, 1)} · {forecastSourceLabel(stock.dividendForecast.source)}</small>
               </div>
-              <div className="stock-chart"><Sparkline values={stock.sparkline} positive={stock.changePct >= 0} /><span>%B {number(stock.percentB * 100, 0)}</span></div>
+              <div className="stock-chart"><Sparkline values={stock.sparkline} positive={changePct >= 0} /><span>%B {number(stock.percentB * 100, 0)}</span></div>
               <div className="stock-signals">
                 <div>{stock.signals.slice(0, 3).map((signal) => <SignalPill key={signal.key} status={signal.status}>{signal.label}</SignalPill>)}</div>
                 <p>{stock.summary}</p>
@@ -145,8 +156,9 @@ export default function Dashboard({ data, onSelect, onManage, liveQuotes }: Prop
                 <ScoreRing score={stock.score} />
                 <span>{stock.action}<ArrowRight size={15} /></span>
               </div>
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       </section>
 

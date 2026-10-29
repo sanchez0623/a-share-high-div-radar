@@ -11,6 +11,7 @@ import type {
   RiskVerification,
   RiskVerificationStatus,
 } from '../shared/types.ts';
+import { isIsoCalendarDate } from '../shared/date.ts';
 import { RiskError } from './errors.ts';
 import { ALL_LEVELS } from './research.ts';
 import type { DemoState } from './state.ts';
@@ -163,8 +164,8 @@ function isRiskType(value: unknown): value is RiskType {
 }
 
 export function requireIsoDate(value: unknown, field: string): string {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    throw new RiskError(`${field}必须为YYYY-MM-DD格式`);
+  if (!isIsoCalendarDate(value)) {
+    throw new RiskError(`${field}必须为有效的YYYY-MM-DD日期`);
   }
   return value;
 }
@@ -235,7 +236,10 @@ export function normalizeRiskRecord(
   const source = raw.source;
   if (typeof source.publisher !== 'string' || !source.publisher) return null;
   if (typeof source.excerpt !== 'string' || !source.excerpt) return null;
-  if (typeof source.publishedAt !== 'string') return null;
+  /** 落盘日期必须是真实存在的 YYYY-MM-DD；格式或日历被改坏时按损坏处理，不猜测原值。 */
+  if (!isIsoCalendarDate(source.publishedAt)) {
+    return null;
+  }
   if (!Number.isInteger(source.revision) || source.revision < 1) return null;
 
   let verification: RiskVerification | null = null;
@@ -243,9 +247,11 @@ export function normalizeRiskRecord(
     const item = raw.verification;
     if (
       typeof item.verifiedAt !== 'string' ||
+      !Number.isFinite(Date.parse(item.verifiedAt)) ||
       typeof item.verifiedBy !== 'string' ||
       typeof item.note !== 'string' ||
       typeof item.expiresAt !== 'string' ||
+      !Number.isFinite(Date.parse(item.expiresAt)) ||
       !isRiskSeverity(item.severity) ||
       !Number.isInteger(item.revision)
     ) {
@@ -260,6 +266,26 @@ export function normalizeRiskRecord(
       severity: item.severity,
       expiresAt: item.expiresAt,
     };
+  }
+
+  /**
+   * 失效标记决定旧核验是否继续有效，不能静默降级。
+   * 非空但不是合法时间戳时按损坏处理，否则损坏值会被当成“未失效”而重新放行等级。
+   */
+  let invalidatedAt: string | null = null;
+  if (raw.invalidatedAt !== undefined && raw.invalidatedAt !== null) {
+    if (
+      typeof raw.invalidatedAt !== 'string' ||
+      !Number.isFinite(Date.parse(raw.invalidatedAt))
+    ) {
+      return null;
+    }
+    invalidatedAt = raw.invalidatedAt;
+  }
+  let invalidatedReason: string | null = null;
+  if (raw.invalidatedReason !== undefined && raw.invalidatedReason !== null) {
+    if (typeof raw.invalidatedReason !== 'string') return null;
+    invalidatedReason = raw.invalidatedReason;
   }
 
   return {
@@ -278,7 +304,7 @@ export function normalizeRiskRecord(
       revision: source.revision,
     },
     verification,
-    invalidatedAt: typeof raw.invalidatedAt === 'string' ? raw.invalidatedAt : null,
-    invalidatedReason: typeof raw.invalidatedReason === 'string' ? raw.invalidatedReason : null,
+    invalidatedAt,
+    invalidatedReason,
   };
 }

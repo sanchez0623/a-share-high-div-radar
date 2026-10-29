@@ -25,6 +25,7 @@ import type {
   TradeResponse,
 } from '../shared/types.ts';
 import { api } from './api.ts';
+import { useLiveQuotes } from './hooks/useLiveQuotes.ts';
 import { ChecklistModal, TradeModal, WatchlistModal } from './components/AppModals.tsx';
 import { ErrorScreen, LoadingScreen, Toast } from './components/UI.tsx';
 import Dashboard from './pages/Dashboard.tsx';
@@ -64,12 +65,27 @@ export default function App() {
   // 请求序列号：只有最新一次请求的响应可以写入状态，避免乱序响应覆盖新数据。
   const dashboardSeq = useRef(0);
   const detailSeq = useRef(0);
+  const previewSeq = useRef(0);
   // 最新选中的标的，供异步回调判断自己是否已经过期。
   const latestSymbolRef = useRef(selectedSymbol);
+
+  /**
+   * 本地写操作成功后作废此前发出的读取请求。
+   * 写响应携带的状态一定比在途 GET 新，否则旧响应会把现金、持仓、门槛或计划回滚到写入前。
+   */
+  const invalidatePendingReads = useCallback(() => {
+    dashboardSeq.current += 1;
+    detailSeq.current += 1;
+    previewSeq.current += 1;
+  }, []);
 
   useEffect(() => {
     latestSymbolRef.current = selectedSymbol;
   }, [selectedSymbol]);
+
+  // 实时行情轮询：观察仓（含持仓的观察标的）作为 watch 列表；失败不清空旧数据。
+  const watchSymbols = useMemo(() => data?.stocks.map((stock) => stock.symbol) ?? [], [data]);
+  const liveQuotes = useLiveQuotes(watchSymbols);
 
   const loadData = useCallback(async () => {
     const seq = ++dashboardSeq.current;
@@ -91,6 +107,8 @@ export default function App() {
 
   // 交易响应已携带按新现金与持仓重算的派生快照：就地合并，避免评分停留在交易前。
   const applyTrade = useCallback((result: TradeResponse) => {
+    /** 交易响应比任何在途看板/详情请求都新：先作废它们，旧响应不得回滚现金与持仓。 */
+    invalidatePendingReads();
     const { stocks, ...portfolio } = result;
     setData((previous) => {
       if (!previous) return previous;
@@ -102,7 +120,7 @@ export default function App() {
         portfolio,
       };
     });
-  }, []);
+  }, [invalidatePendingReads]);
 
   useEffect(() => {
     if (!data || !selectedSymbol) return;
@@ -130,11 +148,13 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const selectStock = (symbol: string) => {
+  /** target 为切换后停留的页面：页内切换器（个股/分红/计划）传当前视图，其余入口默认进入个股研究透视。 */
+  const selectStock = (symbol: string, target: View = 'detail') => {
+    previewSeq.current += 1;
     setSelectedSymbol(symbol);
     setPreview(null);
     setSearch('');
-    navigate('detail');
+    navigate(target);
   };
 
   const refresh = async () => {
@@ -159,10 +179,11 @@ export default function App() {
     }
   };
 
-  /** 统一的写操作收口：执行 mutation → 重新拉取看板 → 反馈结果；失败同时提示并抛回给表单。 */
+  /** 统一的写操作收口：执行 mutation → 作废在途读取 → 重新拉取看板 → 反馈结果；失败同时提示并抛回给表单。 */
   const runMutation = useCallback(async (action: () => Promise<string | null>) => {
     try {
       const message = await action();
+      invalidatePendingReads();
       try {
         await loadData();
       } catch {
@@ -174,10 +195,18 @@ export default function App() {
       setToast((reason as Error).message || '操作失败，请稍后重试');
       throw reason;
     }
-  }, [loadData]);
+  }, [invalidatePendingReads, loadData]);
+
+  /** 观察仓变更同样属于本地 mutation：先作废在途读取，再按新列表重新拉取看板。 */
+  const reloadAfterMutation = useCallback(() => {
+    invalidatePendingReads();
+    return loadData();
+  }, [invalidatePendingReads, loadData]);
 
   const saveAssumption = (symbol: string, input: AssumptionInput) => runMutation(async () => {
     const updated = await api.saveAssumption(symbol, input);
+    /** 保存响应已是服务端最新状态：先作废保存前发出的详情与预览请求，旧响应不得覆盖保存结果。 */
+    invalidatePendingReads();
     // 保存期间可能已切入其他标的：不再回写旧详情，也不跳转。
     if (symbol !== latestSymbolRef.current) {
       return `${updated.stock.name} 的分红假设已保存为 v${updated.assumption.version}，当前已切换到其他标的`;
@@ -189,7 +218,10 @@ export default function App() {
   });
 
   const previewAssumption = async (symbol: string, input: AssumptionInput) => {
+    /** 预览独立序列：同一标的连续预览时，只有最后一次请求的响应可以写入。 */
+    const seq = ++previewSeq.current;
     const result = await api.previewAssumption(symbol, input);
+    if (seq !== previewSeq.current) return;
     if (symbol !== latestSymbolRef.current) return;
     setPreview(result);
     setToast(`已生成临时价格阶梯（保存后为 v${result.assumption.version}）`);
@@ -273,17 +305,17 @@ export default function App() {
         </header>
 
         <main className="main-content">
-          {view === 'dashboard' && <Dashboard data={data} onSelect={selectStock} onManage={() => setModal('watchlist')} />}
-          {view === 'detail' && (activeDetail ? <StockDetail detail={activeDetail} stocks={data.stocks} onSelect={selectStock} onBack={() => navigate('dashboard')} onOpenPlan={() => navigate('plan')} /> : detailLoading)}
-          {view === 'lab' && (activeDetail ? <DividendLab detail={activeDetail} stocks={data.stocks} onSelect={selectStock} onSave={(input) => saveAssumption(activeDetail.stock.symbol, input)} onPreview={(input) => previewAssumption(activeDetail.stock.symbol, input)} /> : detailLoading)}
-          {view === 'plan' && (activeDetail ? <PlanPage detail={activeDetail} stocks={data.stocks} onSelect={selectStock} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
+          {view === 'dashboard' && <Dashboard data={data} onSelect={selectStock} onManage={() => setModal('watchlist')} liveQuotes={liveQuotes} />}
+          {view === 'detail' && (activeDetail ? <StockDetail detail={activeDetail} stocks={data.stocks} onSelect={(symbol) => selectStock(symbol, 'detail')} onBack={() => navigate('dashboard')} onOpenPlan={() => navigate('plan')} quote={liveQuotes.quotes.get(activeDetail.stock.symbol)} quoteError={liveQuotes.error} /> : detailLoading)}
+          {view === 'lab' && (activeDetail ? <DividendLab detail={activeDetail} stocks={data.stocks} onSelect={(symbol) => selectStock(symbol, 'lab')} onSave={(input) => saveAssumption(activeDetail.stock.symbol, input)} onPreview={(input) => previewAssumption(activeDetail.stock.symbol, input)} /> : detailLoading)}
+          {view === 'plan' && (activeDetail ? <PlanPage detail={activeDetail} stocks={data.stocks} onSelect={(symbol) => selectStock(symbol, 'plan')} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
           {view === 'risk' && <RiskPage data={data} onVerify={verifyRisk} onAddRisk={addRisk} onRefreshSource={refreshRiskSource} />}
           {view === 'portfolio' && <PortfolioPage data={data} onTrade={() => setModal('trade')} />}
           {view === 'blueprint' && <BlueprintPage />}
         </main>
       </div>
 
-      {modal === 'watchlist' && <WatchlistModal onClose={() => setModal(null)} onChanged={loadData} />}
+      {modal === 'watchlist' && <WatchlistModal onClose={() => setModal(null)} onChanged={reloadAfterMutation} />}
       {modal === 'trade' && <TradeModal stocks={data.tradeStocks} initialSymbol={selectedSymbol} onClose={() => setModal(null)} onTraded={async (result) => { applyTrade(result); setToast('模拟交易已记录，组合现金流与评分已更新'); }} />}
       {modal === 'checklist' && activeDetail && <ChecklistModal detail={activeDetail} preview={preview} onClose={() => setModal(null)} onCopied={() => setToast('研究清单已复制到剪贴板')} />}
       {toast && <Toast message={toast} onClose={() => setToast('')} />}

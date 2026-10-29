@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,7 @@ import { after, before, test } from 'node:test';
 import type {
   AssumptionPreviewResponse,
   DashboardResponse,
+  PersistedPortfolio,
   Portfolio,
   RiskMutationResponse,
   Stock,
@@ -16,9 +17,10 @@ import type {
 } from '../shared/types.ts';
 import { researchPrice } from '../shared/assumptions.ts';
 import { createApp, type AppOptions } from './app.ts';
-import { createFileAssumptionStore } from './assumption-store.ts';
-import { createFileRiskStore } from './risk-store.ts';
-import { createFilePortfolioStore } from './portfolio-store.ts';
+import { createFileAssumptionStore, type AssumptionStore } from './assumption-store.ts';
+import { createFileSettingsStore, type SettingsStore } from './settings-store.ts';
+import { createFileRiskStore, type RiskStore } from './risk-store.ts';
+import { createFilePortfolioStore, type PortfolioStore } from './portfolio-store.ts';
 import { createDemoState } from './demo-data.ts';
 
 let server: Server;
@@ -63,12 +65,15 @@ function postAssumption(symbol: string, body: unknown, base = baseUrl) {
   });
 }
 
-function postAssumptionPreview(symbol: string, body: unknown, base = baseUrl) {
-  return fetch(`${base}/api/stocks/${symbol}/assumption/preview`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+function postAssumptionPreview(symbol: string, body: unknown, base = baseUrl, budget?: number) {
+  return fetch(
+    `${base}/api/stocks/${symbol}/assumption/preview${typeof budget === 'number' ? `?budget=${budget}` : ''}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 function postRiskVerify(id: string, body: unknown, base = baseUrl) {
@@ -178,6 +183,94 @@ test('设置接口要求至少一个可写字段，且数值必须合法', async
   assert.match(((await arrayBody.json()) as { error?: string }).error ?? '', /JSON对象/);
 });
 
+test('未保存假设时设置门槛同样落盘，重启后不回到默认值', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-settings-'));
+  const file = join(directory, 'settings.json');
+  let first: Awaited<ReturnType<typeof startServer>> | null = null;
+  let second: Awaited<ReturnType<typeof startServer>> | null = null;
+
+  try {
+    first = await startServer(undefined, undefined, undefined, {
+      settingsStore: createFileSettingsStore(file),
+    });
+    const beforeResponse = await fetch(`${first.baseUrl}/api/stocks/601318.SH`);
+    const before = (await beforeResponse.json()) as StockDetailResponse;
+    assert.equal(before.stock.buyThreshold, 5.5);
+    assert.equal(before.assumptionSaved, false);
+
+    const patched = await fetch(`${first.baseUrl}/api/stocks/601318.SH/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ buyThreshold: 6.2 }),
+    });
+    assert.equal(patched.status, 200);
+    assert.equal(((await patched.json()) as Stock).buyThreshold, 6.2);
+
+    /** 第二次设置必须保留第一只标的的门槛快照，而不是覆盖成只剩本次修改。 */
+    const secondPatch = await fetch(`${first.baseUrl}/api/stocks/601088.SH/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ buyThreshold: 6.5 }),
+    });
+    assert.equal(secondPatch.status, 200);
+
+    await new Promise<void>((resolve, reject) => {
+      first!.server.close((error) => (error ? reject(error) : resolve()));
+    });
+    first = null;
+
+    /** 没有正式假设也必须沿用用户设定的门槛，而不是演示默认值。 */
+    second = await startServer(undefined, undefined, undefined, {
+      settingsStore: createFileSettingsStore(file),
+    });
+    const detailResponse = await fetch(`${second.baseUrl}/api/stocks/601318.SH`);
+    assert.equal(detailResponse.status, 200);
+    const detail = (await detailResponse.json()) as StockDetailResponse;
+    assert.equal(detail.stock.buyThreshold, 6.2);
+    assert.equal(detail.assumption.requiredYield, 6.2);
+    assert.equal(detail.assumption.version, 0);
+    assert.equal(detail.assumptionSaved, false);
+
+    const otherResponse = await fetch(`${second.baseUrl}/api/stocks/601088.SH`);
+    const other = (await otherResponse.json()) as StockDetailResponse;
+    assert.equal(other.stock.buyThreshold, 6.5);
+
+    const dashboardResponse = await fetch(`${second.baseUrl}/api/dashboard`);
+    const dashboard = (await dashboardResponse.json()) as DashboardResponse;
+    const radarStock = dashboard.stocks.find((stock) => stock.symbol === '601318.SH');
+    assert.equal(radarStock?.buyThreshold, 6.2);
+  } finally {
+    if (first) await new Promise<void>((resolve) => first!.server.close(() => resolve()));
+    if (second) await new Promise<void>((resolve) => second!.server.close(() => resolve()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('门槛落盘失败时不写内存，内存保持变更前的默认值', async () => {
+  const settingsStore: SettingsStore = {
+    load: () => null,
+    save: () => {
+      throw new Error('EACCES: permission denied');
+    },
+  };
+  const started = await startServer(undefined, undefined, undefined, { settingsStore });
+
+  try {
+    const response = await fetch(`${started.baseUrl}/api/stocks/601318.SH/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ buyThreshold: 6.2 }),
+    });
+    assert.equal(response.status, 500);
+
+    const detailResponse = await fetch(`${started.baseUrl}/api/stocks/601318.SH`);
+    const detail = (await detailResponse.json()) as StockDetailResponse;
+    assert.equal(detail.stock.buyThreshold, 5.5);
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
+  }
+});
+
 test('风险状态由事件派生，PATCH 直写会被拒绝', async () => {
   const response = await patchSettings('601318.SH', { riskVerified: true });
   assert.equal(response.status, 400);
@@ -188,6 +281,40 @@ test('风险状态由事件派生，PATCH 直写会被拒绝', async () => {
   assert.equal(detail.stock.riskGate.totalCount, 1);
   assert.equal(detail.stock.riskGate.openCount, 1);
   assert.equal(detail.stock.riskGate.verified, false);
+});
+
+test('风险原文日期必须是真实日历日期，伪日期不会被登记', async () => {
+  const response = await postRisk({
+    symbol: '600941.SH',
+    title: '演示：伪日期公告',
+    type: '公告',
+    severity: 'low',
+    summary: '演示：2026-02-31 与 2026-13-01 都不是真实日期，必须拒绝登记。',
+    source: {
+      publisher: '演示公告库',
+      excerpt: '演示原文摘录：发布日期为不存在的日历日期。',
+      publishedAt: '2026-02-31',
+    },
+  });
+  assert.equal(response.status, 400);
+  assert.match(
+    ((await response.json()) as { error?: string }).error ?? '',
+    /有效的YYYY-MM-DD/,
+  );
+
+  const monthOutOfRange = await postRisk({
+    symbol: '600941.SH',
+    title: '演示：非法月份',
+    type: '公告',
+    severity: 'low',
+    summary: '演示：13 月同样不是合法日历日期。',
+    source: {
+      publisher: '演示公告库',
+      excerpt: '演示原文摘录：月份越界。',
+      publishedAt: '2026-13-01',
+    },
+  });
+  assert.equal(monthOutOfRange.status, 400);
 });
 
 test('核验接口要求备注与证据，任何严重度都不例外', async () => {
@@ -250,6 +377,15 @@ test('单条核验只关闭自身；新增高风险后等级与动作按公开�
   assert.equal(detail.stock.level, 'L0');
   assert.equal(detail.stock.action, '风险阻断');
   assert.equal(detail.plan.every((tier) => !tier.unlocked), true);
+  /** 全部锁定时资金计划必须同步归零，不能同时给出可执行买入。 */
+  assert.equal(detail.allocation.totalShares, 0);
+  assert.equal(detail.allocation.totalAllocated, 0);
+  assert.ok(
+    detail.allocation.tiers.every(
+      (tier) => tier.allocatedShares === 0 && tier.blockers.some((reason) => reason.includes('风险闸门阻断')),
+    ),
+    '每个锁定档位都需给出风险阻断原因',
+  );
   assert.equal(detail.stock.riskGate.invalidatedCount, 1);
 
   const dashboard = (await (await fetch(`${baseUrl}/api/dashboard`)).json()) as DashboardResponse;
@@ -395,6 +531,175 @@ test('风险核验记录与原文版本随服务重启恢复', async () => {
   } finally {
     if (first) await new Promise<void>((resolve) => first!.server.close(() => resolve()));
     if (second) await new Promise<void>((resolve) => second!.server.close(() => resolve()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('风险文件损坏时拒绝启动，且不覆盖原文件', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-risk-broken-'));
+  const file = join(directory, 'risks.json');
+  const broken = '{"version":1,"items":[';
+  writeFileSync(file, broken, 'utf8');
+
+  try {
+    assert.throws(
+      () => createApp(createDemoState(), undefined, createFileRiskStore(file)),
+      /风险核验文件/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), broken);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('单条风险记录校验失败时拒绝启动，不静默丢弃高风险', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-risk-invalid-'));
+  const file = join(directory, 'risks.json');
+  const items = [
+    {
+      id: 'risk-601318.SH',
+      symbol: '601318.SH',
+      title: '可正常解析的风险',
+      type: '公告',
+      severity: 'high',
+      date: '2026-01-01',
+      summary: '用于验证前一条合法记录不会被部分恢复',
+      source: {
+        publisher: '测试来源',
+        url: null,
+        excerpt: '原文摘录',
+        publishedAt: '2026-01-01',
+        revision: 1,
+      },
+      verification: null,
+      invalidatedAt: null,
+      invalidatedReason: null,
+    },
+    { id: 'risk-600941.SH', symbol: '600941.SH', type: '公告' },
+  ];
+  const content = JSON.stringify({ version: 1, items }, null, 2);
+  writeFileSync(file, content, 'utf8');
+
+  try {
+    assert.throws(
+      () => createApp(createDemoState(), undefined, createFileRiskStore(file)),
+      /第 2 条/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), content);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('失效时间损坏时拒绝启动，避免旧核验被当成未失效而复活', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-risk-invalidated-'));
+  const file = join(directory, 'risks.json');
+  const content = JSON.stringify({
+    version: 1,
+    items: [
+      {
+        id: 'risk-601318.SH',
+        symbol: '601318.SH',
+        title: '已核验但已作废的风险',
+        type: '公告',
+        severity: 'medium',
+        date: '2026-01-01',
+        summary: '用于验证损坏的失效时间不会被静默当作未失效',
+        source: {
+          publisher: '测试来源',
+          url: null,
+          excerpt: '原文摘录',
+          publishedAt: '2026-01-01',
+          revision: 2,
+        },
+        verification: {
+          verifiedAt: '2026-01-02T00:00:00.000Z',
+          verifiedBy: '研究员',
+          note: '已核对原文',
+          evidenceUrl: 'https://example.com/notice',
+          revision: 1,
+          severity: 'medium',
+          expiresAt: '2026-01-16T00:00:00.000Z',
+        },
+        invalidatedAt: 1767225600000,
+        invalidatedReason: '原文更新至 v2，原核验失效',
+      },
+    ],
+  });
+  writeFileSync(file, content, 'utf8');
+
+  try {
+    assert.throws(
+      () => createApp(createDemoState(), undefined, createFileRiskStore(file)),
+      /第 1 条/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), content);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('核验时间无法解析时拒绝启动，不把损坏时间当作有效核验', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-risk-timestamp-'));
+  const file = join(directory, 'risks.json');
+  const content = JSON.stringify({
+    version: 1,
+    items: [
+      {
+        id: 'risk-601318.SH',
+        symbol: '601318.SH',
+        title: '核验时间损坏的风险',
+        type: '公告',
+        severity: 'medium',
+        date: '2026-01-01',
+        summary: '用于验证无法解析的核验时间会阻止启动',
+        source: {
+          publisher: '测试来源',
+          url: null,
+          excerpt: '原文摘录',
+          publishedAt: '2026-01-01',
+          revision: 1,
+        },
+        verification: {
+          verifiedAt: 'not-a-date',
+          verifiedBy: '研究员',
+          note: '已核对原文',
+          evidenceUrl: 'https://example.com/notice',
+          revision: 1,
+          severity: 'medium',
+          expiresAt: '2026-01-16T00:00:00.000Z',
+        },
+        invalidatedAt: null,
+        invalidatedReason: null,
+      },
+    ],
+  });
+  writeFileSync(file, content, 'utf8');
+
+  try {
+    assert.throws(
+      () => createApp(createDemoState(), undefined, createFileRiskStore(file)),
+      /第 1 条/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), content);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('风险文件存在但为空时按空状态恢复，不回退演示种子', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-risk-empty-'));
+  const file = join(directory, 'risks.json');
+  writeFileSync(file, JSON.stringify({ version: 1, items: [] }), 'utf8');
+  const started = await startServer(undefined, createFileRiskStore(file));
+
+  try {
+    const dashboard = (await (
+      await fetch(`${started.baseUrl}/api/dashboard`)
+    ).json()) as DashboardResponse;
+    assert.equal(dashboard.risks.length, 0);
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -560,6 +865,70 @@ test('交易接口拒绝非法价格，导出CSV禁用缓存且按最新账本�
   }
 });
 
+test('跨源导出暴露 Content-Disposition，前端可保留服务端文件名', async () => {
+  const response = await fetch(`${baseUrl}/api/export/watchlist`, {
+    headers: { Origin: 'http://localhost:5173' },
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-disposition') ?? '', /filename="watchlist-/);
+  assert.match(
+    response.headers.get('access-control-expose-headers') ?? '',
+    /Content-Disposition/i,
+  );
+  await response.text();
+});
+
+test('非法成交日期直接拒绝，不会静默替换成行情日', async () => {
+  const isolated = await startServer();
+  try {
+    const readDashboard = async () =>
+      (await (await fetch(`${isolated.baseUrl}/api/dashboard`)).json()) as DashboardResponse;
+    const before = await readDashboard();
+
+    const trade = (body: unknown) =>
+      fetch(`${isolated.baseUrl}/api/portfolio/trade`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const pseudoDay = await trade({
+      symbol: '601318.SH',
+      side: 'buy',
+      shares: 100,
+      price: 48.6,
+      executedAt: '2026-02-31',
+    });
+    assert.equal(pseudoDay.status, 400);
+    assert.match(((await pseudoDay.json()) as { error?: string }).error ?? '', /成交日期/);
+
+    const malformed = await trade({
+      symbol: '601318.SH',
+      side: 'buy',
+      shares: 100,
+      price: 48.6,
+      executedAt: '2026/10/23',
+    });
+    assert.equal(malformed.status, 400);
+
+    const rejected = await readDashboard();
+    assert.equal(rejected.portfolio.cash, before.portfolio.cash);
+    assert.equal(rejected.portfolio.trades.length, before.portfolio.trades.length);
+    assert.equal(
+      rejected.portfolio.positions.find((item) => item.symbol === '601318.SH')?.shares,
+      before.portfolio.positions.find((item) => item.symbol === '601318.SH')?.shares,
+    );
+
+    /** 省略成交日期仍按行情日记录，但这是缺省值而不是对非法输入的替换。 */
+    const accepted = await trade({ symbol: '601318.SH', side: 'buy', shares: 100, price: 48.6 });
+    assert.equal(accepted.status, 200);
+    const portfolio = (await accepted.json()) as TradeResponse;
+    assert.equal(portfolio.trades.at(-1)?.executedAt, '2026-10-23');
+  } finally {
+    await new Promise<void>((resolve) => isolated.server.close(() => resolve()));
+  }
+});
+
 test('未知股票代码返回404', async () => {
   const response = await patchSettings('999999.SH', { buyThreshold: 5 });
   assert.equal(response.status, 404);
@@ -590,6 +959,28 @@ test('临时预览返回与实验室一致的价格，且不写入正式假设',
   assert.deepEqual(
     preview.plan.map((tier) => tier.targetPrice),
     [6, 6.5, 7].map((requiredYield) => researchPrice(3.95, requiredYield)),
+  );
+  /** 预览快照与分配必须同属一套预览口径，不能拼上旧等级与旧股数。 */
+  assert.equal(preview.stock.forecastDividend, 3.95);
+  assert.equal(preview.stock.buyThreshold, 6);
+  assert.equal(preview.stock.assumptionVersion, 1);
+  assert.deepEqual(
+    preview.allocation.tiers.map((tier) => tier.targetPrice),
+    preview.plan.map((tier) => tier.targetPrice),
+  );
+
+  const budgeted = await postAssumptionPreview(
+    '600941.SH',
+    { forecastYear: 2026, scenario: 'conservative', requiredYield: 6 },
+    baseUrl,
+    10_000,
+  );
+  assert.equal(budgeted.status, 200);
+  const budgetedPreview = (await budgeted.json()) as AssumptionPreviewResponse;
+  assert.equal(budgetedPreview.allocation.approvedBudget, 10_000);
+  assert.deepEqual(
+    budgetedPreview.allocation.tiers.map((tier) => tier.targetPrice),
+    preview.plan.map((tier) => tier.targetPrice),
   );
 
   const detail = await readDetail('600941.SH');
@@ -858,5 +1249,151 @@ test('服务重启后观察仓、现金、持仓、交易账本与复盘均恢�
     if (first) await new Promise<void>((resolve) => first!.server.close(() => resolve()));
     if (second) await new Promise<void>((resolve) => second!.server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('组合落盘失败时交易与观察仓变更整体回滚，重试只记账一次', async () => {
+  /** 注入磁盘满：落盘抛错，恢复后才真正写入。 */
+  let diskFull = true;
+  const writes: PersistedPortfolio[] = [];
+  const portfolioStore: PortfolioStore = {
+    load: () => null,
+    save: (next) => {
+      if (diskFull) throw new Error('ENOSPC: no space left on device');
+      writes.push(structuredClone(next));
+    },
+  };
+  const started = await startServer(undefined, undefined, portfolioStore);
+  const tradeBody = {
+    symbol: '000333.SZ',
+    side: 'buy',
+    shares: 100,
+    price: 70,
+    executedAt: '2026-10-29',
+  };
+
+  try {
+    const failedTrade = await fetch(`${started.baseUrl}/api/portfolio/trade`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tradeBody),
+    });
+    assert.equal(failedTrade.status, 500);
+
+    const failedAdd = await fetch(`${started.baseUrl}/api/watchlist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '601088.SH' }),
+    });
+    assert.equal(failedAdd.status, 500);
+
+    /** 内存必须保持变更前：现金未扣、账本为空、持仓与观察仓未动。 */
+    const afterFailure = (await (
+      await fetch(`${started.baseUrl}/api/dashboard`)
+    ).json()) as DashboardResponse;
+    assert.equal(afterFailure.portfolio.cash, 50_000);
+    assert.equal(afterFailure.portfolio.trades.length, 0);
+    assert.equal(
+      afterFailure.tradeStocks.find((stock) => stock.symbol === '000333.SZ')?.holdingShares,
+      0,
+    );
+    assert.ok(afterFailure.stocks.every((stock) => stock.symbol !== '601088.SH'));
+    assert.equal(writes.length, 0, '落盘失败时不应产生任何写入');
+
+    diskFull = false;
+    const retriedTrade = await fetch(`${started.baseUrl}/api/portfolio/trade`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tradeBody),
+    });
+    assert.equal(retriedTrade.status, 200);
+    const traded = (await retriedTrade.json()) as TradeResponse;
+    /** 失败的那一笔没有留在内存里，重试后账本只有一笔成交。 */
+    assert.equal(traded.trades.length, 1);
+    assert.equal(
+      traded.stocks.find((stock) => stock.symbol === '000333.SZ')?.holdingShares,
+      100,
+    );
+    assert.ok(traded.cash < 50_000);
+
+    const retriedAdd = await fetch(`${started.baseUrl}/api/watchlist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '601088.SH' }),
+    });
+    assert.equal(retriedAdd.status, 200);
+    const catalog = (await retriedAdd.json()) as Array<{ symbol: string; inWatchlist: boolean }>;
+    assert.equal(catalog.find((item) => item.symbol === '601088.SH')?.inWatchlist, true);
+    assert.equal(writes.length, 2);
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
+  }
+});
+
+test('假设与风险落盘失败时不升版本、不写核验，恢复后重试只生效一次', async () => {
+  let diskFull = true;
+  const persistedAssumptions: unknown[] = [];
+  const assumptionStore: AssumptionStore = {
+    load: () => [],
+    save: (items) => {
+      if (diskFull) throw new Error('EACCES: permission denied');
+      persistedAssumptions.push(structuredClone(items));
+    },
+  };
+  const riskStore: RiskStore = {
+    load: () => null,
+    save: () => {
+      if (diskFull) throw new Error('EACCES: permission denied');
+    },
+  };
+  const started = await startServer(assumptionStore, riskStore);
+  const verifyBody = {
+    note: '已核对平安公告原文与派息口径',
+    evidenceUrl: 'https://example.com/pingan/notice',
+  };
+
+  try {
+    const failedAssumption = await postAssumption(
+      '601088.SH',
+      { forecastYear: 2028, scenario: 'base', requiredYield: 7 },
+      started.baseUrl,
+    );
+    assert.equal(failedAssumption.status, 500);
+    const failedVerify = await postRiskVerify('risk-601318.SH', verifyBody, started.baseUrl);
+    assert.equal(failedVerify.status, 500);
+
+    /** 内存必须保持变更前：假设未保存、版本仍为0，风险仍待核验。 */
+    const detailResponse = await fetch(`${started.baseUrl}/api/stocks/601088.SH`);
+    const detail = (await detailResponse.json()) as StockDetailResponse;
+    assert.equal(detail.assumptionSaved, false);
+    assert.equal(detail.assumption.version, 0);
+    assert.equal(detail.stock.assumptionVersion, 0);
+
+    const afterFailure = (await (
+      await fetch(`${started.baseUrl}/api/dashboard`)
+    ).json()) as DashboardResponse;
+    const unfixed = afterFailure.risks.find((risk) => risk.id === 'risk-601318.SH');
+    assert.equal(unfixed?.status, 'pending');
+    assert.equal(unfixed?.verification, null);
+    assert.equal(persistedAssumptions.length, 0, '落盘失败时不应产生任何写入');
+
+    diskFull = false;
+    const retriedAssumption = await postAssumption(
+      '601088.SH',
+      { forecastYear: 2028, scenario: 'base', requiredYield: 7 },
+      started.baseUrl,
+    );
+    assert.equal(retriedAssumption.status, 200);
+    const saved = (await retriedAssumption.json()) as StockDetailResponse;
+    /** 失败的那一次没有递增版本，重试后仍是 v1。 */
+    assert.equal(saved.assumption.version, 1);
+    assert.equal(persistedAssumptions.length, 1);
+
+    const retriedVerify = await postRiskVerify('risk-601318.SH', verifyBody, started.baseUrl);
+    assert.equal(retriedVerify.status, 200);
+    const verified = (await retriedVerify.json()) as RiskMutationResponse;
+    assert.equal(verified.risk.status, 'verified');
+  } finally {
+    await new Promise<void>((resolve) => started.server.close(() => resolve()));
   }
 });

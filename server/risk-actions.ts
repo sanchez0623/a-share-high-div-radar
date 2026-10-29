@@ -5,7 +5,7 @@ import type {
   RiskSourcePatch,
   RiskVerificationInput,
 } from '../shared/types.ts';
-import { RiskError } from './errors.ts';
+import { RiskError, RiskPersistenceError } from './errors.ts';
 import {
   RISK_POLICY,
   deriveRiskEvent,
@@ -141,12 +141,30 @@ export function updateRiskSource(
   return deriveRiskEvent(risk, now);
 }
 
-/** 服务启动时恢复风险原文与核验记录；空记录保留演示种子。 */
-export function hydrateRisks(state: DemoState, records: unknown[]): void {
-  const restored = records
-    .map((record) => normalizeRiskRecord(record, state))
-    .filter((record): record is RiskEventRecord => record !== null);
-  if (restored.length > 0) state.risks = restored;
+/**
+ * 服务启动时恢复风险原文与核验记录。
+ * `null` 表示文件尚未创建，只有这种情况可以保留演示种子；空数组是真实的空状态。
+ * 文件存在时，任何一条记录校验失败都视为数据损坏并拒绝启动：
+ * 静默丢弃高风险记录会直接放行研究等级，并会在下一次写盘时永久覆盖原文件。
+ */
+export function hydrateRisks(state: DemoState, records: unknown[] | null): void {
+  if (records === null) return;
+
+  const restored: RiskEventRecord[] = [];
+  records.forEach((record, index) => {
+    const normalized = normalizeRiskRecord(record, state);
+    if (!normalized) {
+      const id =
+        record && typeof record === 'object' && typeof (record as { id?: unknown }).id === 'string'
+          ? `（id=${(record as { id: string }).id}）`
+          : '';
+      throw new RiskPersistenceError(
+        `风险记录第 ${index + 1} 条校验失败${id}：字段缺失、所属股票未知或类型非法，拒绝启动`,
+      );
+    }
+    restored.push(normalized);
+  });
+  state.risks = restored;
 }
 
 function invalidateSymbolVerifications(

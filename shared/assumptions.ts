@@ -1,4 +1,5 @@
 import type {
+  DividendQualityBasis,
   DividendQualityStatus,
   DividendRecord,
   DividendScenario,
@@ -66,6 +67,15 @@ export const DIVIDEND_QUALITY_LABELS: Record<DividendQualityStatus, string> = {
 
 export function dividendQualityLabel(status: DividendQualityStatus): string {
   return DIVIDEND_QUALITY_LABELS[status] ?? DIVIDEND_QUALITY_LABELS.watch;
+}
+
+export const DIVIDEND_QUALITY_BASIS_LABELS: Record<DividendQualityBasis, string> = {
+  matching: '对应年度口径',
+  base: '基期质量参考',
+};
+
+export function dividendQualityBasisLabel(basis: DividendQualityBasis): string {
+  return DIVIDEND_QUALITY_BASIS_LABELS[basis] ?? DIVIDEND_QUALITY_BASIS_LABELS.base;
 }
 
 export function roundTo(value: number, digits = 2): number {

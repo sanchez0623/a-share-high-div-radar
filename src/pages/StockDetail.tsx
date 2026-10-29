@@ -1,13 +1,16 @@
 import { ArrowLeft, ArrowRight, CheckCircle2, CircleDashed, ShieldAlert } from 'lucide-react';
 import type { StockDetailResponse, Stock } from '../../shared/types.ts';
 import {
+  dividendQualityBasisLabel,
   dividendQualityLabel,
   forecastSourceLabel,
   statBasisLabel,
 } from '../../shared/assumptions.ts';
 import { DividendBars, PriceChart } from '../components/Charts.tsx';
+import { QuoteBadge } from '../components/QuoteBadge.tsx';
 import { LevelBadge, SectionHeading, SignalPill } from '../components/UI.tsx';
 import { money, number, percent } from '../format.ts';
+import type { Quote } from '../../shared/quote-types.ts';
 
 interface Props {
   detail: StockDetailResponse;
@@ -15,9 +18,12 @@ interface Props {
   onSelect: (symbol: string) => void;
   onBack: () => void;
   onOpenPlan: () => void;
+  /** 选中标的的实时行情；轮询失败或缺失时由 QuoteBadge 呈现降级状态。 */
+  quote?: Quote;
+  quoteError?: string;
 }
 
-export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPlan }: Props) {
+export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPlan, quote, quoteError }: Props) {
   const { stock, history, dividends, plan } = detail;
   const nextTier = plan.find((tier) => !tier.unlocked) ?? plan.at(-1)!;
 
@@ -32,7 +38,7 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
 
       <section className="detail-hero">
         <div>
-          <div className="detail-stock-meta"><LevelBadge level={stock.level} /><span>{stock.symbol}</span><span>{stock.sector}</span></div>
+          <div className="detail-stock-meta"><LevelBadge level={stock.level} /><span>{stock.symbol}</span><span>{stock.sector}</span><QuoteBadge quote={quote} error={quoteError} /></div>
           <h1>{stock.name}</h1>
           <p>{stock.summary}</p>
         </div>
@@ -45,7 +51,7 @@ export default function StockDetail({ detail, stocks, onSelect, onBack, onOpenPl
 
       <section className="metric-strip">
         <div><span>最近收盘</span><strong>¥{number(stock.price)}</strong><small className={stock.changePct >= 0 ? 'up' : 'down'}>{stock.changePct >= 0 ? '+' : ''}{percent(stock.changePct)}</small></div>
-        <div><span>预测每股分红</span><strong>¥{number(stock.forecastDividend)}</strong><small>派息率 {percent(stock.payoutRatio, 0)} · 质量 {dividendQualityLabel(stock.dividendQuality.status)}</small></div>
+        <div><span>预测每股分红</span><strong>¥{number(stock.forecastDividend)}</strong><small>派息率 {percent(stock.payoutRatio, 0)} · 质量 {dividendQualityLabel(stock.dividendQuality.status)}{stock.dividendQuality.basis === 'base' ? `（${dividendQualityBasisLabel(stock.dividendQuality.basis)}）` : ''}</small></div>
         <div><span>布林位置</span><strong>%B {number(stock.percentB * 100, 0)}</strong><small>下轨 ¥{number(stock.bollLower)} · 前复权</small></div>
         <div><span>ATR 波动</span><strong>¥{number(stock.atr)}</strong><small>MA20 ¥{number(stock.ma20)}</small></div>
         <div><span>估值 / 盈利</span><strong>{number(stock.pe, 1)} PE</strong><small>PE {statBasisLabel(stock.valuationBasis.pe)} · ROE {statBasisLabel(stock.valuationBasis.roe)} {percent(stock.roe, 1)}</small></div>

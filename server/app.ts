@@ -24,18 +24,20 @@ import {
   resolveAssumption,
   saveAssumption,
 } from './assumptions.ts';
-import { AS_OF, DATA_META, DATA_NOTICE } from './config.ts';
+import { AS_OF, DATA_META, DATA_NOTICE, getDataNotice } from './config.ts';
 import { AssumptionError, RiskError, SettingsError, TradeError } from './errors.ts';
 import { buildAllocation, executeTrade, getPortfolio, hydratePortfolio } from './portfolio.ts';
 import { buildResearchPlan } from './research.ts';
 import { getRiskEvents, RISK_POLICY } from './risk-model.ts';
 import { addRiskEvent, hydrateRisks, updateRiskSource, verifyRisk } from './risk-actions.ts';
 import { createOriginGuard, createTokenGuard, isAllowedOrigin } from './security.ts';
-import { updateStockSettings } from './settings.ts';
+import { collectSettings, hydrateSettings, updateStockSettings } from './settings.ts';
+import { createMemorySettingsStore, type SettingsStore } from './settings-store.ts';
 import { getStockSnapshot } from './snapshot.ts';
+import type { QuoteService } from './quote-service.ts';
 import { commitPortfolioChange, commitResearchChange, collectPortfolioSymbols } from './state-change.ts';
 import { reviewTrades } from './trade-review.ts';
-import type { DemoState } from './state.ts';
+import { cloneDemoState, commitDemoState, type DemoState } from './state.ts';
 import { createMemoryAssumptionStore, type AssumptionStore } from './assumption-store.ts';
 import { createMemoryRiskStore, type RiskStore } from './risk-store.ts';
 import {
@@ -57,7 +59,14 @@ export interface AppOptions {
   allowedOrigins?: string[];
   /** 访问令牌；配置后所有 /api 请求必须携带，绑定非回环地址时必填。 */
   accessToken?: string;
+  /** 实时行情服务；未提供时 /api/quotes 返回 503。 */
+  quoteService?: QuoteService;
+  /** 设置项（买入门槛）的持久化存储；缺省仅写入内存。 */
+  settingsStore?: SettingsStore;
 }
+
+/** /api/quotes 单次请求的标的数上限；观察仓远小于该值，仅防滥用。 */
+const MAX_QUOTE_SYMBOLS = 50;
 
 export function createApp(
   state: DemoState,
@@ -68,68 +77,96 @@ export function createApp(
 ) {
   const app = express();
   const extraOrigins = options.allowedOrigins ?? [];
+  const settingsStore = options.settingsStore ?? createMemorySettingsStore();
   app.disable('x-powered-by');
   /** 先拦来源再交给 cors：预检请求同样按白名单拒绝，浏览器拿不到任何响应头。 */
   app.use('/api', createOriginGuard(extraOrigins));
-  app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin, extraOrigins)) }));
+  /** 跨源下载需要读取文件名：不暴露 Content-Disposition 时会退回固定文件名。 */
+  app.use(
+    cors({
+      origin: (origin, callback) => callback(null, isAllowedOrigin(origin, extraOrigins)),
+      exposedHeaders: ['Content-Disposition'],
+    }),
+  );
   /** 预检不带令牌，cors 已在此前结束 OPTIONS，因此令牌只约束真实请求。 */
   app.use('/api', createTokenGuard(options.accessToken ?? ''));
   app.use(express.json());
 
+  /** 门槛先于假设恢复：已保存假设的 requiredYield 会覆盖同一标的的门槛。 */
+  hydrateSettings(state, settingsStore.load());
   hydrateAssumptions(state, store.load());
   hydrateRisks(state, riskStore.load());
   hydratePortfolio(state, portfolioStore.load());
 
-  function persistAssumptions(): void {
-    store.save(Array.from(state.assumptions.values()));
+  function persistAssumptions(target: DemoState): void {
+    store.save(Array.from(target.assumptions.values()));
   }
 
-  function persistRisks(): void {
-    riskStore.save(state.risks);
+  function persistSettings(target: DemoState): void {
+    settingsStore.save(collectSettings(target));
   }
 
-  function persistPortfolio(): void {
+  function persistRisks(target: DemoState): void {
+    riskStore.save(target.risks);
+  }
+
+  function persistPortfolio(target: DemoState): void {
     portfolioStore.save({
-      watchlist: Array.from(state.watchlist),
-      cash: state.cash,
-      holdings: Array.from(state.holdings, ([symbol, holding]) => ({
+      watchlist: Array.from(target.watchlist),
+      cash: target.cash,
+      holdings: Array.from(target.holdings, ([symbol, holding]) => ({
         symbol,
         shares: holding.shares,
         cost: holding.cost,
         assumptionVersion: holding.assumptionVersion,
       })),
-      trades: state.trades,
+      trades: target.trades,
     });
   }
 
-  /** 风险写操作统一返回最新风险事件与重算后的股票闸门。 */
-  function respondWithRisk(res: Response, risk: RiskEvent): void {
-    const { stock } = commitResearchChange(state, risk.symbol);
-    const response: RiskMutationResponse = { risk, stock };
-    res.json(response);
+  /**
+   * 写路由的唯一事务边界：变更只作用于状态副本，落盘成功后才提交到内存。
+   * 落盘失败（磁盘满、只读目录等）会抛出并由错误中间件返回 500，
+   * 此时内存仍为变更前的状态，客户端重试不会重复记账或叠加版本号。
+   */
+  function runWrite<T>(
+    mutate: (draft: DemoState) => T,
+    persist: (draft: DemoState, result: T) => void,
+  ): T {
+    const draft = cloneDemoState(state);
+    const result = mutate(draft);
+    persist(draft, result);
+    commitDemoState(state, draft);
+    return result;
   }
 
-  function buildDetail(stock: Stock, budget?: number): StockDetailResponse {
-    const assumption = resolveAssumption(state, stock.symbol);
+  /** 风险写操作统一返回最新风险事件与重算后的股票闸门。 */
+  function buildRiskMutation(target: DemoState, risk: RiskEvent): RiskMutationResponse {
+    const { stock } = commitResearchChange(target, risk.symbol);
+    return { risk, stock };
+  }
+
+  function buildDetail(target: DemoState, stock: Stock, budget?: number): StockDetailResponse {
+    const assumption = resolveAssumption(target, stock.symbol);
     const plan = buildResearchPlan(stock, assumption);
     return {
       stock,
-      history: state.histories.get(stock.symbol)!,
-      dividends: state.dividends.get(stock.symbol)!,
+      history: target.histories.get(stock.symbol)!,
+      dividends: target.dividends.get(stock.symbol)!,
       plan,
       assumption,
-      assumptionSaved: state.assumptions.has(stock.symbol),
+      assumptionSaved: target.assumptions.has(stock.symbol),
       /** 分配：以已到账现金、最低储备与集中度上限为约束；budget 缺省用可投入现金。 */
-      allocation: buildAllocation(state, stock.symbol, plan, budget),
+      allocation: buildAllocation(target, stock, plan, budget),
     };
   }
 
-  function getCatalog(): CatalogItem[] {
-    return Array.from(state.stocks.values(), (stock) => ({
+  function getCatalog(target: DemoState): CatalogItem[] {
+    return Array.from(target.stocks.values(), (stock) => ({
       symbol: stock.symbol,
       name: stock.name,
       sector: stock.sector,
-      inWatchlist: state.watchlist.has(stock.symbol),
+      inWatchlist: target.watchlist.has(stock.symbol),
     }));
   }
 
@@ -138,7 +175,7 @@ export function createApp(
       status: 'ok',
       dataMode: DATA_META.dataMode,
       asOf: AS_OF,
-      dataNotice: DATA_NOTICE,
+      dataNotice: getDataNotice(),
       dataMeta: DATA_META,
     });
   });
@@ -146,21 +183,21 @@ export function createApp(
   app.get('/api/dashboard', (_req, res) => {
     const response: DashboardResponse = {
       asOf: AS_OF,
-      dataMode: 'demo',
+      dataMode: DATA_META.dataMode,
       stocks: Array.from(state.watchlist, (symbol) => getStockSnapshot(state, symbol)),
       /** 交易候选与观察仓分离：移出观察仓的持仓仍必须可卖出。 */
       tradeStocks: collectPortfolioSymbols(state).map((symbol) => getStockSnapshot(state, symbol)),
       portfolio: getPortfolio(state),
       risks: getRiskEvents(state),
       riskPolicy: RISK_POLICY,
-      dataNotice: DATA_NOTICE,
+      dataNotice: getDataNotice(),
       dataMeta: DATA_META,
     };
     res.json(response);
   });
 
   app.get('/api/catalog', (_req, res) => {
-    const response: CatalogItem[] = getCatalog();
+    const response: CatalogItem[] = getCatalog(state);
     res.json(response);
   });
 
@@ -173,7 +210,7 @@ export function createApp(
 
     const rawBudget = typeof req.query.budget === 'string' ? Number(req.query.budget) : NaN;
     const budget = Number.isFinite(rawBudget) && rawBudget >= 0 ? rawBudget : undefined;
-    res.json(buildDetail(getStockSnapshot(state, symbol), budget));
+    res.json(buildDetail(state, getStockSnapshot(state, symbol), budget));
   });
 
   app.post('/api/stocks/:symbol/assumption', (req, res) => {
@@ -184,10 +221,15 @@ export function createApp(
     }
 
     try {
-      saveAssumption(state, symbol, parseAssumptionInput(req.body));
-      persistAssumptions();
-      const { stock } = commitResearchChange(state, symbol);
-      res.json(buildDetail(stock));
+      const detail = runWrite(
+        (draft) => {
+          saveAssumption(draft, symbol, parseAssumptionInput(req.body));
+          const { stock } = commitResearchChange(draft, symbol);
+          return buildDetail(draft, stock);
+        },
+        persistAssumptions,
+      );
+      res.json(detail);
     } catch (error) {
       if (error instanceof AssumptionError) {
         res.status(400).json({ error: error.message });
@@ -205,11 +247,20 @@ export function createApp(
     }
 
     try {
-      const preview: AssumptionPreviewResponse = previewAssumption(
+      const { assumption, stock, plan } = previewAssumption(
         state,
         symbol,
         parseAssumptionInput(req.body),
       );
+      /** 预算与正式详情同一口径：预览分配必须按预览价格阶梯重算。 */
+      const rawBudget = typeof req.query.budget === 'string' ? Number(req.query.budget) : NaN;
+      const budget = Number.isFinite(rawBudget) && rawBudget >= 0 ? rawBudget : undefined;
+      const preview: AssumptionPreviewResponse = {
+        assumption,
+        stock,
+        plan,
+        allocation: buildAllocation(state, stock, plan, budget),
+      };
       res.json(preview);
     } catch (error) {
       if (error instanceof AssumptionError) {
@@ -229,9 +280,18 @@ export function createApp(
     }
 
     try {
-      const { assumptionUpdated } = updateStockSettings(state, symbol, req.body);
-      if (assumptionUpdated) persistAssumptions();
-      const { stock } = commitResearchChange(state, symbol);
+      const stock = runWrite(
+        (draft) => {
+          const { assumptionUpdated } = updateStockSettings(draft, symbol, req.body);
+          const { stock } = commitResearchChange(draft, symbol);
+          return { stock, assumptionUpdated };
+        },
+        (draft, result) => {
+          /** 有正式假设：门槛随假设版本落盘；没有假设：门槛单独落盘，否则重启后回到默认值。 */
+          if (result.assumptionUpdated) persistAssumptions(draft);
+          else persistSettings(draft);
+        },
+      ).stock;
       res.json(stock);
     } catch (error) {
       if (error instanceof SettingsError) {
@@ -248,9 +308,14 @@ export function createApp(
       res.status(400).json({ error: '股票代码无效' });
       return;
     }
-    state.watchlist.add(symbol);
-    persistPortfolio();
-    res.json(getCatalog());
+    const catalog = runWrite(
+      (draft) => {
+        draft.watchlist.add(symbol);
+        return getCatalog(draft);
+      },
+      persistPortfolio,
+    );
+    res.json(catalog);
   });
 
   app.delete('/api/watchlist/:symbol', (req, res) => {
@@ -263,9 +328,14 @@ export function createApp(
       res.status(409).json({ error: '观察仓至少需要保留一只股票' });
       return;
     }
-    state.watchlist.delete(symbol);
-    persistPortfolio();
-    res.json(getCatalog());
+    const catalog = runWrite(
+      (draft) => {
+        draft.watchlist.delete(symbol);
+        return getCatalog(draft);
+      },
+      persistPortfolio,
+    );
+    res.json(catalog);
   });
 
   /** 逐条记录人工核验：备注必填、高风险必须留证据、有效期由公开政策决定。 */
@@ -275,9 +345,15 @@ export function createApp(
       return;
     }
     try {
-      const risk = verifyRisk(state, req.params.id, req.body as RiskVerificationInput);
-      persistRisks();
-      respondWithRisk(res, risk);
+      const response = runWrite(
+        (draft) =>
+          buildRiskMutation(
+            draft,
+            verifyRisk(draft, req.params.id, req.body as RiskVerificationInput),
+          ),
+        persistRisks,
+      );
+      res.json(response);
     } catch (error) {
       if (error instanceof RiskError) {
         res.status(400).json({ error: error.message });
@@ -290,9 +366,11 @@ export function createApp(
   /** 登记新的风险事项；高风险会让该股票既有核验全部失效。 */
   app.post('/api/risk', (req, res) => {
     try {
-      const risk = addRiskEvent(state, req.body as RiskEventInput);
-      persistRisks();
-      respondWithRisk(res, risk);
+      const response = runWrite(
+        (draft) => buildRiskMutation(draft, addRiskEvent(draft, req.body as RiskEventInput)),
+        persistRisks,
+      );
+      res.json(response);
     } catch (error) {
       if (error instanceof RiskError) {
         res.status(400).json({ error: error.message });
@@ -309,9 +387,15 @@ export function createApp(
       return;
     }
     try {
-      const risk = updateRiskSource(state, req.params.id, req.body as RiskSourcePatch);
-      persistRisks();
-      respondWithRisk(res, risk);
+      const response = runWrite(
+        (draft) =>
+          buildRiskMutation(
+            draft,
+            updateRiskSource(draft, req.params.id, req.body as RiskSourcePatch),
+          ),
+        persistRisks,
+      );
+      res.json(response);
     } catch (error) {
       if (error instanceof RiskError) {
         res.status(400).json({ error: error.message });
@@ -323,11 +407,15 @@ export function createApp(
 
   app.post('/api/portfolio/trade', (req, res) => {
     try {
-      executeTrade(state, req.body as TradeRequest);
-      persistPortfolio();
-      /** 现金与持仓已变化：统一重算组合账本与派生快照，响应直接携带最新评分。 */
-      const { portfolio, stocks } = commitPortfolioChange(state);
-      const response: TradeResponse = { ...portfolio, stocks };
+      const response = runWrite(
+        (draft) => {
+          executeTrade(draft, req.body as TradeRequest);
+          /** 现金与持仓已变化：统一重算组合账本与派生快照，响应直接携带最新评分。 */
+          const { portfolio, stocks } = commitPortfolioChange(draft);
+          return { ...portfolio, stocks } satisfies TradeResponse;
+        },
+        persistPortfolio,
+      );
       res.json(response);
     } catch (error) {
       if (error instanceof TradeError) {
@@ -398,6 +486,30 @@ export function createApp(
         'Cache-Control': 'no-store',
       })
       .send(`\uFEFF${csv}`);
+  });
+
+  /** 实时行情只读链路：symbols 必须过滤到观察仓白名单，防止变成任意代码行情代理。 */
+  app.get('/api/quotes', async (req, res) => {
+    const quoteService = options.quoteService;
+    if (!quoteService) {
+      res.status(503).json({ error: '行情服务未启用' });
+      return;
+    }
+    const raw = typeof req.query.symbols === 'string' ? req.query.symbols : '';
+    const symbols = raw.split(',').map(normalizeSymbol).filter((symbol) => state.stocks.has(symbol));
+    if (symbols.length === 0) {
+      res.status(400).json({ error: '缺少有效的 symbols' });
+      return;
+    }
+    if (symbols.length > MAX_QUOTE_SYMBOLS) {
+      res.status(400).json({ error: `单次最多 ${MAX_QUOTE_SYMBOLS} 只` });
+      return;
+    }
+    try {
+      res.json(await quoteService.getSnapshot(symbols));
+    } catch {
+      res.status(503).json({ error: '行情源暂不可用' });
+    }
   });
 
   app.use('/api', (_req, res) => {

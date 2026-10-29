@@ -22,6 +22,7 @@ import type {
   RiskVerificationInput,
   RiskVerificationStatus,
 } from '../../shared/types.ts';
+import { isIsoCalendarDate } from '../../shared/date.ts';
 import { SectionHeading } from '../components/UI.tsx';
 
 interface Props {
@@ -380,8 +381,8 @@ function AddRiskForm({
       setError('股票、标题、摘要、发布方与原文摘录均为必填项');
       return;
     }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(publishedAt)) {
-      setError('原文发布日期必须为YYYY-MM-DD格式');
+    if (!isIsoCalendarDate(publishedAt)) {
+      setError('原文发布日期必须为有效的YYYY-MM-DD日期');
       return;
     }
     setBusy(true);

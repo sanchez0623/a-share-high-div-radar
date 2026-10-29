@@ -2,6 +2,7 @@ import type { SettingsPatch } from '../shared/types.ts';
 import { REQUIRE_YIELD_MAX, REQUIRE_YIELD_MIN } from '../shared/assumptions.ts';
 import { saveAssumption } from './assumptions.ts';
 import { SettingsError } from './errors.ts';
+import type { PersistedSettings } from './settings-store.ts';
 import type { DemoState } from './state.ts';
 
 /** 设置项白名单：请求体里只允许出现这些字段，其余键一律拒绝而不是静默忽略。 */
@@ -45,6 +46,41 @@ function parseSettingsPatch(body: unknown): Required<SettingsPatch> {
 export interface SettingsMutationResult {
   /** 已保存假设随研究门槛同步升版，调用方需要落盘。 */
   assumptionUpdated: boolean;
+}
+
+/**
+ * 服务启动时套用已落盘的买入门槛。
+ * 必须在假设恢复之前调用：已保存假设的 requiredYield 才是最终口径，
+ * 假设恢复会覆盖同一标的的门槛，因此这里只负责“没有正式假设”的那部分。
+ */
+export function hydrateSettings(state: DemoState, settings: PersistedSettings | null): void {
+  if (!settings) return;
+  for (const [symbol, threshold] of Object.entries(settings.buyThresholds)) {
+    const stock = state.stocks.get(symbol);
+    if (!stock) continue;
+    if (
+      typeof threshold !== 'number' ||
+      !Number.isFinite(threshold) ||
+      threshold < REQUIRE_YIELD_MIN ||
+      threshold > REQUIRE_YIELD_MAX
+    ) {
+      continue;
+    }
+    state.stocks.set(symbol, { ...stock, buyThreshold: threshold });
+  }
+}
+
+/**
+ * 需要落盘的门槛快照：只收集没有正式假设的标的。
+ * 有正式假设时门槛已随假设版本落盘，再写一份会造成两处真相。
+ */
+export function collectSettings(state: DemoState): PersistedSettings {
+  const buyThresholds: Record<string, number> = {};
+  for (const [symbol, stock] of state.stocks) {
+    if (state.assumptions.has(symbol)) continue;
+    buyThresholds[symbol] = stock.buyThreshold;
+  }
+  return { buyThresholds };
 }
 
 /**

@@ -8,6 +8,8 @@ export type ForecastSource = 'announced' | 'guidance' | 'extrapolation' | 'assum
 /** 财务指标口径：年报 / 单季 / TTM。 */
 export type StatBasis = 'annual' | 'quarter' | 'ttm';
 export type DividendQualityStatus = 'sustainable' | 'watch' | 'fragile';
+/** 质量结论口径：matching = 预测年度与质量数据年度一致；base = 仅基期数据参考。 */
+export type DividendQualityBasis = 'matching' | 'base';
 /** 现金分红所处阶段：已到账 / 已宣告待收 / 预计未宣告。 */
 export type DividendStage = 'received' | 'declared' | 'projected';
 /** 记账口径：税前 / 税后。 */
@@ -47,6 +49,10 @@ export interface DividendQualityCheck {
 /** 可持续分红质量检查：派息率、现金流覆盖、利润波动与杠杆质量。 */
 export interface DividendQuality {
   status: DividendQualityStatus;
+  /** 质量结论口径：口径与预测年度不一致时仅为基期质量参考，不能视为预测年度质量结论。 */
+  basis: DividendQualityBasis;
+  /** 质量数据对应的报告年度；null 表示未标注年度归属。 */
+  dataYear: number | null;
   payoutRatio: number;
   /** 经营现金流对年度分红的覆盖倍数。 */
   operatingCashFlowCoverage: number;
@@ -225,6 +231,9 @@ export interface DividendFlow {
   name: string;
   sector: string;
   stage: DividendStage;
+  /** 年度归属：历史分红按除息日所在年度，预计未宣告按预测年度。 */
+  year: number;
+  /** 生成该笔流水使用的股数：历史分红为除息日登记在册的权益股数，预计为当前持仓。 */
   shares: number;
   dividendPerShare: number;
   /** 税前金额。 */
@@ -365,9 +374,12 @@ export interface Portfolio {
   cash: number;
   marketValue: number;
   totalAssets: number;
+  /** 预测年度分红：各持仓按其预测年度假设折算，不等于未来 12 个月到账口径。 */
   annualDividend: number;
-  /** 税后口径的预计年分红（演示按 10% 红利税估算）。 */
+  /** 税后口径的预测年度分红（演示按 10% 红利税估算）。 */
   annualDividendAfterTax: number;
+  /** 未来 12 个月预计到账分红（税后）：已宣告待收 + 归属当前年度的预计未宣告，不含已到账。 */
+  nextTwelveMonthDividendAfterTax: number;
   portfolioYield: number;
   positions: PortfolioPosition[];
   /** 分档现金流：已到账 / 已宣告待收 / 预计未宣告。 */
@@ -544,9 +556,14 @@ export interface StockDetailResponse {
   allocation: PlanAllocation;
 }
 
+/** 临时预览快照：假设、重算后的股票结论、价格阶梯与资金分配必须整份使用。 */
 export interface AssumptionPreviewResponse {
   assumption: DividendAssumption;
+  /** 按预览假设重算的股票快照（等级、股息率、质量检查均来自预览口径）。 */
+  stock: Stock;
   plan: PlanTier[];
+  /** 按预览价格阶梯计算的资金分配，避免新计划搭配旧股数与旧费用。 */
+  allocation: PlanAllocation;
 }
 
 export interface CatalogItem {

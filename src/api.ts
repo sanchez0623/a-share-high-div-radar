@@ -14,6 +14,7 @@ import type {
   TradeResponse,
   TradeReviewResponse,
 } from '../shared/types.ts';
+import type { QuoteSnapshotResponse } from '../shared/quote-types.ts';
 
 /** 跨设备部署时后端会要求访问令牌；回环部署无需设置，取不到就按同源匿名请求。 */
 const ACCESS_TOKEN_KEY = 'dividend-atlas.access-token';
@@ -53,11 +54,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
-  previewAssumption: (symbol: string, input: AssumptionInput) =>
-    request<AssumptionPreviewResponse>(`/api/stocks/${symbol}/assumption/preview`, {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
+  previewAssumption: (symbol: string, input: AssumptionInput, budget?: number) =>
+    request<AssumptionPreviewResponse>(
+      `/api/stocks/${symbol}/assumption/preview${typeof budget === 'number' && budget >= 0 ? `?budget=${budget}` : ''}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(input),
+      },
+    ),
   updateSettings: (symbol: string, patch: SettingsPatch) =>
     request<Stock>(`/api/stocks/${symbol}/settings`, {
       method: 'PATCH',
@@ -91,6 +95,9 @@ export const api = {
       body: JSON.stringify(trade),
     }),
   review: () => request<TradeReviewResponse>('/api/portfolio/review'),
+  /** 实时行情快照：仅接受观察仓内的标的，服务端会做白名单过滤。 */
+  quotes: (symbols: string[]) =>
+    request<QuoteSnapshotResponse>(`/api/quotes?symbols=${encodeURIComponent(symbols.join(','))}`),
   /** CSV 导出同样需要令牌头，所以走 fetch 而不是 <a href> 直连。 */
   async exportWatchlist(): Promise<void> {
     const response = await fetch('/api/export/watchlist', { headers: tokenHeaders() });

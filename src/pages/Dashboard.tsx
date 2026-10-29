@@ -12,15 +12,18 @@ import type { DashboardResponse } from '../../shared/types.ts';
 import { forecastSourceLabel, statBasisLabel } from '../../shared/assumptions.ts';
 import { compactMoney, money, number, percent } from '../format.ts';
 import { OpportunityMap, ScoreRing, Sparkline } from '../components/Charts.tsx';
+import { QuoteStatusBadge } from '../components/QuoteBadge.tsx';
 import { LevelBadge, SectionHeading, SignalPill } from '../components/UI.tsx';
+import type { LiveQuotesResult } from '../hooks/useLiveQuotes.ts';
 
 interface Props {
   data: DashboardResponse;
   onSelect: (symbol: string) => void;
   onManage: () => void;
+  liveQuotes: LiveQuotesResult;
 }
 
-export default function Dashboard({ data, onSelect, onManage }: Props) {
+export default function Dashboard({ data, onSelect, onManage, liveQuotes }: Props) {
   const [sortMode, setSortMode] = useState<'watchlist' | 'score' | 'yield'>('watchlist');
   const stocks = useMemo(() => {
     const result = [...data.stocks];
@@ -45,9 +48,10 @@ export default function Dashboard({ data, onSelect, onManage }: Props) {
         </div>
         <div className="hero-income">
           <span className="eyebrow light">FUTURE CASH FLOW</span>
-          <p>未来 12 个月预计分红</p>
+          <p>预测年度分红</p>
           <strong>{money(data.portfolio.annualDividend, 0)}</strong>
           <div className="income-bottom">
+            <span>未来 12 个月到账 <b>{money(data.portfolio.nextTwelveMonthDividendAfterTax, 0)}</b></span>
             <span>组合股息率 <b>{percent(data.portfolio.portfolioYield)}</b></span>
             <span>总资产 {compactMoney(data.portfolio.totalAssets)}</span>
           </div>
@@ -57,6 +61,7 @@ export default function Dashboard({ data, onSelect, onManage }: Props) {
 
       <div className="data-ribbon">
         <div><FlaskConical size={16} /><strong>演示研究环境</strong><span>{data.dataNotice}</span></div>
+        <QuoteStatusBadge snapshot={liveQuotes.snapshot} error={liveQuotes.error} />
         <div><Database size={15} />行情 {data.dataMeta.quoteTime}<span className="ribbon-divider" />{data.dataMeta.priceAdjustment === 'forward' ? '前复权' : '不复权'}口径 · PE {statBasisLabel(data.dataMeta.peBasis)} · ROE {statBasisLabel(data.dataMeta.roeBasis)}</div>
       </div>
 

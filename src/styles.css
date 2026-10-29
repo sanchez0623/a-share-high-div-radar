@@ -955,3 +955,14 @@ table { width: 100%; border-collapse: collapse; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* ---- 实时行情徽章（P0 只读行情条：研究评分仍基于演示收盘数据） ---- */
+.quote-badge { display: inline-flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+.quote-dot { width: 7px; height: 7px; border-radius: 50%; }
+.quote-dot--live { background: #5c886f; box-shadow: 0 0 0 3px rgba(92, 136, 111, 0.12); }
+.quote-dot--stale { background: #d9a441; box-shadow: 0 0 0 3px rgba(217, 164, 65, 0.14); }
+.quote-dot--error { background: var(--coral); box-shadow: 0 0 0 3px rgba(233, 117, 88, 0.14); }
+.quote-session { color: var(--ink-soft); font-family: "Aptos", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 11px; }
+.quote-time { color: var(--muted); }
+.quote-badge strong { color: var(--ink); font-size: 13px; }
+.quote-badge small { font-size: 10px; }

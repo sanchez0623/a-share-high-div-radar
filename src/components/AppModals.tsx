@@ -147,6 +147,8 @@ export function ChecklistModal({ detail, preview, onClose, onCopied }: { detail:
   const draft = preview?.assumption.symbol === stock.symbol ? preview : null;
   const plan = draft?.plan ?? detail.plan;
   const assumption = draft?.assumption ?? detail.assumption;
+  /** 预览清单必须整份引用预览快照，避免把新计划与旧等级、旧闸门拼在一起。 */
+  const viewStock = draft?.stock ?? stock;
   const versionLabel = draft
     ? `临时假设（保存后为 v${assumption.version}）`
     : assumption.version > 0
@@ -155,10 +157,10 @@ export function ChecklistModal({ detail, preview, onClose, onCopied }: { detail:
   const assumptionLine = `${assumption.forecastYear}年 · ${scenarioMeta(assumption.scenario).label}情景 · 每股分红 ¥${number(assumption.dividendPerShare)} · 要求股息率 ${percent(assumption.requiredYield, 1)}`;
   const traceLine = `预测来源 ${forecastSourceLabel(assumption.source)} · 报告期 ${assumption.reportPeriod} · 公告日期 ${assumption.announcementDate ?? '无'}`;
   const text = [
-    `【息壤研究清单】${stock.name} ${stock.symbol}`,
-    `当前：¥${stock.price}，预测股息率 ${percent(stock.dividendYield)}，%B ${(stock.percentB * 100).toFixed(0)}%，等级 ${stock.level}`,
-    `风险闸门：${stock.riskGate.summary}`,
-    `允许研究等级：${stock.riskGate.allowedLevels.join(' / ') || '无（全部阻断）'}`,
+    `【息壤研究清单】${viewStock.name} ${viewStock.symbol}`,
+    `当前：¥${viewStock.price}，预测股息率 ${percent(viewStock.dividendYield)}，%B ${(viewStock.percentB * 100).toFixed(0)}%，等级 ${viewStock.level}`,
+    `风险闸门：${viewStock.riskGate.summary}`,
+    `允许研究等级：${viewStock.riskGate.allowedLevels.join(' / ') || '无（全部阻断）'}`,
     `研究假设（${versionLabel}）：${assumptionLine}`,
     `${traceLine}`,
     `假设说明：${assumption.hypothesis}`,
@@ -185,7 +187,7 @@ export function ChecklistModal({ detail, preview, onClose, onCopied }: { detail:
   return (
     <Modal title={`${stock.name} · 研究清单`} eyebrow="BEFORE ANY ACTION" onClose={onClose} wide>
       <div className="checklist-preview">
-        <div className="checklist-stock"><LevelBadge level={stock.level} /><strong>{stock.name}</strong><span>当前 {percent(stock.dividendYield)} · %B {(stock.percentB * 100).toFixed(0)}%</span></div>
+        <div className="checklist-stock"><LevelBadge level={viewStock.level} /><strong>{viewStock.name}</strong><span>当前 {percent(viewStock.dividendYield)} · %B {(viewStock.percentB * 100).toFixed(0)}%</span></div>
         <div className={`checklist-assumption ${draft ? 'draft' : ''}`}><span>{versionLabel}</span><p>{assumptionLine}</p><p>{traceLine}</p><p>假设说明：{assumption.hypothesis}</p></div>
         {plan.map((tier) => <div className="checklist-tier" key={tier.level}><div><LevelBadge level={tier.level} /><strong>{money(tier.targetPrice ?? 0)}</strong><span>{tier.shares} 股参考</span></div>{tier.conditions.map((condition) => <p key={condition}><span className="empty-checkbox" />{condition}</p>)}</div>)}
         <div className="manual-checks"><p><span className="empty-checkbox" />已阅读最新财报与分红公告原文</p><p><span className="empty-checkbox" />已检查自由现金流与派息可持续性</p><p><span className="empty-checkbox" />已确认组合现金与仓位约束</p></div>

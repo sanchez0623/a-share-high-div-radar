@@ -22,6 +22,8 @@ import {
   buildPlanAllocation,
 } from '../shared/allocation.ts';
 import { DIVIDEND_TAX_RATE, MIN_TRADE_PRICE, PRICE_TICK, estimateTradeFees } from '../shared/costs.ts';
+import { isIsoCalendarDate } from '../shared/date.ts';
+import { dividendQualityLabel } from '../shared/assumptions.ts';
 import { resolveAssumption } from './assumptions.ts';
 import { AS_OF } from './config.ts';
 import { TradeError } from './errors.ts';
@@ -31,22 +33,46 @@ import { deriveRiskEvent } from './risk-model.ts';
 import { getStockSnapshot } from './snapshot.ts';
 import type { DemoState } from './state.ts';
 
-/** 单只持仓的三段分红流水：已到账、已宣告待收、预计未宣告。 */
+/**
+ * 除息日登记在册的权益股数：当前持仓扣除除息日当日及之后发生的净买入。
+ * 账本从初始持仓起算（初始持仓视为全程在册），因此除息后买入不追溯历史分红，
+ * 除息后的卖出也不会改写历史应收金额；回填异常交易时收敛到 [0, 当前持仓]。
+ */
+function entitledSharesAt(
+  state: DemoState,
+  symbol: string,
+  currentShares: number,
+  exDate: string,
+): number {
+  const signedAfterExDate = state.trades
+    .filter((trade) => trade.symbol === symbol && trade.executedAt >= exDate)
+    .reduce((total, trade) => total + (trade.side === 'buy' ? trade.shares : -trade.shares), 0);
+  return Math.max(0, Math.min(currentShares, currentShares - signedAfterExDate));
+}
+
+/**
+ * 单只持仓的三段分红流水：已到账、已宣告待收（按除息日权益股数追溯）
+ * 与预测年度未宣告（按当前持仓估算，且只扣除归属预测年度的已派/待派部分）。
+ */
 function buildDividendFlows(
+  state: DemoState,
   stock: Stock,
-  shares: number,
+  currentShares: number,
   forecastDividend: number,
+  forecastYear: number,
 ): DividendFlow[] {
-  if (shares <= 0) return [];
+  if (currentShares <= 0) return [];
   const flows: DividendFlow[] = [];
 
   const push = (
     stage: DividendStage,
+    year: number,
+    shares: number,
     dividendPerShare: number,
     payment: DividendPayment | null,
     note: string,
   ) => {
-    if (!(dividendPerShare > 0)) return;
+    if (!(dividendPerShare > 0) || shares <= 0) return;
     const grossAmount = round(shares * dividendPerShare);
     const tax = round(grossAmount * DIVIDEND_TAX_RATE);
     flows.push({
@@ -54,6 +80,7 @@ function buildDividendFlows(
       name: stock.name,
       sector: stock.sector,
       stage,
+      year,
       shares,
       dividendPerShare,
       grossAmount,
@@ -65,30 +92,48 @@ function buildDividendFlows(
     });
   };
 
-  if (stock.receivedDividend) {
+  /** 已到账：权益以除息日登记在册为准，是已发生的历史事实。 */
+  const received = stock.receivedDividend;
+  if (received) {
     push(
       'received',
-      stock.receivedDividend.dividendPerShare,
-      stock.receivedDividend,
-      '已到账现金分红，已包含在可用现金中，不再重复计入',
+      Number(received.exDate.slice(0, 4)),
+      entitledSharesAt(state, stock.symbol, currentShares, received.exDate),
+      received.dividendPerShare,
+      received,
+      `按${received.exDate}除息登记的权益股数追溯，已包含在可用现金中，不再重复计入`,
     );
   }
-  if (stock.pendingDividend) {
+  /** 已宣告待收：同样以除息日登记在册为准，除息后买入不参与本次派息。 */
+  const declared = stock.pendingDividend;
+  if (declared) {
     push(
       'declared',
-      stock.pendingDividend.dividendPerShare,
-      stock.pendingDividend,
-      '已宣告待收，到账前不计入可用现金',
+      Number(declared.exDate.slice(0, 4)),
+      entitledSharesAt(state, stock.symbol, currentShares, declared.exDate),
+      declared.dividendPerShare,
+      declared,
+      `按${declared.exDate}除息登记的权益股数计算，已宣告待收，到账前不计入可用现金`,
     );
   }
-  const settledPerShare =
-    (stock.receivedDividend?.dividendPerShare ?? 0) +
-    (stock.pendingDividend?.dividendPerShare ?? 0);
+  /**
+   * 预测年度未宣告：只扣除除息日落在预测年度内的已派与已宣告部分，
+   * 历史年度的分红不跨年抵扣，保证预测年度口径与流水归属一致。
+   */
+  const sameYearPerShare =
+    (received && Number(received.exDate.slice(0, 4)) === forecastYear
+      ? received.dividendPerShare
+      : 0) +
+    (declared && Number(declared.exDate.slice(0, 4)) === forecastYear
+      ? declared.dividendPerShare
+      : 0);
   push(
     'projected',
-    round(forecastDividend - settledPerShare),
+    forecastYear,
+    currentShares,
+    round(forecastDividend - sameYearPerShare),
     null,
-    '按当前预测分红扣除已派与已宣告部分估算，尚未宣告',
+    `按${forecastYear}年预测每股分红扣除同年度已派与已宣告部分估算，尚未宣告`,
   );
 
   return flows;
@@ -125,7 +170,15 @@ export function getPortfolio(state: DemoState): Portfolio {
       forecastDividend: stock.forecastDividend,
       forecastSource: assumption.source,
     });
-    dividendFlows.push(...buildDividendFlows(stock, holding.shares, stock.forecastDividend));
+    dividendFlows.push(
+      ...buildDividendFlows(
+        state,
+        stock,
+        holding.shares,
+        stock.forecastDividend,
+        assumption.forecastYear,
+      ),
+    );
   }
 
   marketValue = round(marketValue);
@@ -141,6 +194,20 @@ export function getPortfolio(state: DemoState): Portfolio {
     dividendFlows
       .filter((flow) => flow.stage === stage)
       .reduce((total, flow) => total + flow.netAmount, 0);
+  /**
+   * 未来 12 个月到账口径：已宣告待收必然在窗口内到账，
+   * 预计未宣告只计入归属当前年度的预测；已到账是过去的现金流，不再计入。
+   */
+  const currentYear = Number(AS_OF.slice(0, 4));
+  const nextTwelveMonthDividendAfterTax = round(
+    dividendFlows
+      .filter(
+        (flow) =>
+          flow.stage === 'declared' ||
+          (flow.stage === 'projected' && flow.year === currentYear),
+      )
+      .reduce((total, flow) => total + flow.netAmount, 0),
+  );
 
   return {
     cash: settled,
@@ -148,6 +215,7 @@ export function getPortfolio(state: DemoState): Portfolio {
     totalAssets,
     annualDividend,
     annualDividendAfterTax: round(annualDividend * (1 - DIVIDEND_TAX_RATE)),
+    nextTwelveMonthDividendAfterTax,
     portfolioYield: totalAssets > 0 ? round((annualDividend / totalAssets) * 100) : 0,
     positions,
     cashLedger: {
@@ -163,21 +231,22 @@ export function getPortfolio(state: DemoState): Portfolio {
   };
 }
 
-/** 按已到账现金、最低储备与集中度约束，把研究价格阶梯转成可执行分配。 */
+/**
+ * 按已到账现金、最低储备与集中度约束，把研究价格阶梯转成可执行分配。
+ * 风险闸门、研究等级与分红质量一律取传入的股票快照，避免用到缓存里的旧结论。
+ */
 export function buildAllocation(
   state: DemoState,
-  symbol: string,
+  stock: Stock,
   plan: PlanTier[],
   budget?: number,
 ): PlanAllocation {
-  const stock = state.stocks.get(symbol);
-  if (!stock) throw new Error('未知股票代码');
   const portfolio = getPortfolio(state);
   const sectorMarketValue = portfolio.positions
     .filter((position) => position.sector === stock.sector)
     .reduce((total, position) => total + position.marketValue, 0);
   const stockMarketValue =
-    portfolio.positions.find((position) => position.symbol === symbol)?.marketValue ?? 0;
+    portfolio.positions.find((position) => position.symbol === stock.symbol)?.marketValue ?? 0;
 
   return buildPlanAllocation({
     plan,
@@ -190,7 +259,37 @@ export function buildAllocation(
     sector: stock.sector,
     maxStockWeight: DEFAULT_MAX_STOCK_WEIGHT,
     maxSectorWeight: DEFAULT_MAX_SECTOR_WEIGHT,
+    lockReasons: buildLockReasons(stock),
   });
+}
+
+/**
+ * 锁定档位的具体原因：风险闸门优先，其次分红质量封顶，最后是研究条件未达。
+ * 资金分配只认这些原因，锁定档位不再分配任何股数。
+ */
+function buildLockReasons(stock: Stock): Partial<Record<ResearchLevel, string>> {
+  const rank: Record<ResearchLevel, number> = { L0: 0, L1: 1, L2: 2, L3: 3 };
+  const gate = stock.riskGate;
+  const quality = stock.dividendQuality;
+  const qualityCapped = quality.status === 'fragile' || quality.oneOff;
+  const reasons: Partial<Record<ResearchLevel, string>> = {};
+
+  for (const level of ALL_LEVELS) {
+    if (gate.allowedLevels.includes(level) && rank[stock.level] >= rank[level]) continue;
+
+    if (!gate.allowedLevels.includes(level)) {
+      reasons[level] =
+        gate.highestOpenSeverity === 'high'
+          ? `风险闸门阻断${level}：${gate.openCount}项风险未关闭且含高风险，需逐条核验并留下证据`
+          : `风险闸门阻断${level}：${gate.openCount}项中/低风险未关闭，全部核验通过前仅L1/L2可研究`;
+    } else if (qualityCapped) {
+      reasons[level] = `分红质量${dividendQualityLabel(quality.status)}${quality.oneOff ? '且含一次性特别分红' : ''}${quality.basis === 'base' ? '（基期质量参考口径）' : ''}，研究等级封顶L1，${level}不分配资金`;
+    } else {
+      reasons[level] = `研究条件未达到${level}（当前${stock.level}）：预测股息率与布林超跌条件需同时满足才解锁`;
+    }
+  }
+
+  return reasons;
 }
 
 /** 落盘交易记录的边界校验：只保留字段齐全的记录，避免手改文件污染账本。 */
@@ -202,7 +301,7 @@ function isValidTradeRecord(record: unknown): record is TradeRecord {
   if (r.side !== 'buy' && r.side !== 'sell') return false;
   if (typeof r.shares !== 'number' || r.shares <= 0) return false;
   if (typeof r.price !== 'number' || r.price <= 0) return false;
-  if (typeof r.executedAt !== 'string') return false;
+  if (!isIsoCalendarDate(r.executedAt)) return false;
   if (r.taxBasis !== 'pre_tax' && r.taxBasis !== 'after_tax') return false;
   if (r.planLevel !== null && !ALL_LEVELS.includes(r.planLevel as ResearchLevel)) return false;
   return true;
@@ -285,6 +384,10 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
   if (Math.abs(request.price - round(request.price)) > 1e-9) {
     throw new TradeError(`交易价格必须为${PRICE_TICK}元的整数倍`);
   }
+  /** 成交日期可选；一旦提供就必须是真实日历日期，非法值直接拒绝而不是静默退回行情日。 */
+  if (request.executedAt !== undefined && !isIsoCalendarDate(request.executedAt)) {
+    throw new TradeError(`成交日期必须为有效的YYYY-MM-DD日期（如 ${AS_OF}）`);
+  }
 
   const holding = state.holdings.get(request.symbol)!;
   const stock = state.stocks.get(request.symbol)!;
@@ -311,15 +414,22 @@ export function executeTrade(state: DemoState, request: TradeRequest): Portfolio
     if (request.shares > holding.shares) {
       throw new TradeError('持仓数量不足，交易未执行');
     }
+    /** 卖出现金流入：成交金额扣除佣金、过户费与印花税；费用高于成交金额时净回款为负。 */
+    const netProceeds = round(amount - fees.total);
+    if (netProceeds <= 0) {
+      throw new TradeError('卖出净回款不为正：成交金额不足以覆盖交易费用，交易未执行');
+    }
+    /** 净回款计入现金后不得为负，费用吞掉现金的卖出必须在改动持仓前拒绝。 */
+    const cashAfter = round(state.cash + netProceeds);
+    if (cashAfter < 0) {
+      throw new TradeError('成交后现金不足，交易未执行');
+    }
     holding.shares -= request.shares;
     if (holding.shares === 0) holding.cost = 0;
-    state.cash = round(state.cash + amount - fees.total);
+    state.cash = cashAfter;
   }
 
-  const executedAt =
-    typeof request.executedAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(request.executedAt)
-      ? request.executedAt
-      : AS_OF;
+  const executedAt = request.executedAt ?? AS_OF;
   const taxBasis: TaxBasis = request.taxBasis === 'after_tax' ? 'after_tax' : 'pre_tax';
   const planLevel: Exclude<ResearchLevel, 'L0'> | null =
     request.planLevel === 'L1' || request.planLevel === 'L2' || request.planLevel === 'L3'

@@ -9,11 +9,25 @@ import type { DemoState } from './state.ts';
  */
 export function getStockSnapshot(state: DemoState, symbol: string, now = Date.now()): Stock {
   const current = state.stocks.get(symbol);
+  if (!current) throw new Error('未知股票代码');
+  return getSnapshotFromStock(state, symbol, current, now);
+}
+
+/**
+ * 用给定的研究口径（预测分红、门槛、质量）计算快照。
+ * 临时预览把自己的假设投影成一份股票记录后走这里，避免读取缓存里的旧等级与旧预测。
+ */
+export function getSnapshotFromStock(
+  state: DemoState,
+  symbol: string,
+  stock: Stock,
+  now = Date.now(),
+): Stock {
   const history = state.histories.get(symbol);
-  if (!current || !history) throw new Error('未知股票代码');
+  if (!history) throw new Error('未知股票代码');
   const holding = state.holdings.get(symbol) ?? { shares: 0, cost: 0, assumptionVersion: null };
   return analyzeStock({
-    stock: current,
+    stock,
     history,
     availableCash: state.cash,
     riskGate: deriveRiskGate(state.risks, symbol, now),

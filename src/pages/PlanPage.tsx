@@ -35,39 +35,60 @@ export default function PlanPage({
   onCreateChecklist,
 }: Props) {
   const { stock, assumptionSaved } = detail;
-  const [budget, setBudget] = useState(detail.allocation.investableCash);
-  const [allocation, setAllocation] = useState<PlanAllocation>(detail.allocation);
-  const [allocating, setAllocating] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-
   const draft = preview?.assumption.symbol === stock.symbol ? preview : null;
   const assumption = draft?.assumption ?? detail.assumption;
   const plan = draft?.plan ?? detail.plan;
+  /** 预览是一份完整快照：等级、股息率、质量与分配全部取预览口径，不与旧结论混用。 */
+  const viewStock = draft?.stock ?? stock;
+  const baseAllocation = draft?.allocation ?? detail.allocation;
   const totalReference = plan.reduce((sum, tier) => sum + tier.estimatedAmount, 0);
-  const investable = detail.allocation.investableCash;
+  const investable = baseAllocation.investableCash;
+  const [budget, setBudget] = useState(baseAllocation.investableCash);
+  const [allocation, setAllocation] = useState<PlanAllocation>(baseAllocation);
+  const [allocating, setAllocating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
   // 预算重算的请求序列号：只接受最新一次分配计算的结果。
   const allocateSeq = useRef(0);
 
-  // 切换标的或假设变化时，重置预算与分配为服务端默认（真实可投入现金）。
+  // 切换标的或预览快照变化时，重置预算与分配为该快照的默认值。
   useEffect(() => {
     allocateSeq.current += 1;
-    setBudget(detail.allocation.investableCash);
-    setAllocation(detail.allocation);
+    setBudget(baseAllocation.investableCash);
+    setAllocation(baseAllocation);
     setError('');
-  }, [detail]);
+  }, [detail, baseAllocation]);
 
-  // 预算变化时按新预算重新计算分配（防抖），未超过可投入现金时直接复用默认。
+  // 预算变化时按新预算重新计算分配（防抖），回到可投入现金时直接复用快照默认分配。
   useEffect(() => {
-    if (Math.abs(budget - investable) < 0.5) return;
+    if (Math.abs(budget - investable) < 0.5) {
+      /** 预算回到默认值时恢复快照分配，并作废仍在途的请求，避免旧结果覆盖默认分配。 */
+      allocateSeq.current += 1;
+      setAllocation(baseAllocation);
+      setAllocating(false);
+      return;
+    }
     const timer = setTimeout(() => {
       const seq = ++allocateSeq.current;
       setAllocating(true);
-      api
-        .stockWithBudget(stock.symbol, budget)
+      /** 预览中必须按预览假设重算分配，否则会拿旧计划的价格与费用约束新预算。 */
+      const request = draft
+        ? api
+            .previewAssumption(
+              stock.symbol,
+              {
+                forecastYear: draft.assumption.forecastYear,
+                scenario: draft.assumption.scenario,
+                requiredYield: draft.assumption.requiredYield,
+              },
+              budget,
+            )
+            .then((result) => result.allocation)
+        : api.stockWithBudget(stock.symbol, budget).then((result) => result.allocation);
+      request
         .then((result) => {
           if (seq !== allocateSeq.current) return;
-          setAllocation(result.allocation);
+          setAllocation(result);
         })
         .catch((reason: Error) => {
           if (seq === allocateSeq.current) setError(reason.message);
@@ -80,7 +101,7 @@ export default function PlanPage({
       clearTimeout(timer);
       allocateSeq.current += 1;
     };
-  }, [budget, stock.symbol, investable]);
+  }, [budget, stock.symbol, investable, draft, baseAllocation]);
 
   const savePreview = async () => {
     setSaving(true);
@@ -103,6 +124,13 @@ export default function PlanPage({
 
   const maxBudget = Math.max(10000, Math.ceil(investable));
   const step = Math.max(1000, Math.round(maxBudget / 20 / 1000) * 1000);
+  /**
+   * 滑块最右端代表默认预算：受 step 限制右端只能落在 maxBudget 的整步数上，
+   * 因此把右端吸附回可投入现金，否则用户把滑块拖到底也无法真正回到默认值。
+   */
+  const snapToDefault = maxBudget - step < investable;
+  const changeBudget = (next: number) =>
+    setBudget(snapToDefault && next > maxBudget - step ? investable : next);
   const coverage = totalReference > 0 ? Math.min(100, (budget / totalReference) * 100) : 0;
 
   return (
@@ -139,11 +167,11 @@ export default function PlanPage({
         )}
       </section>
       {error && <p className="form-error" role="alert">{error}</p>}
-      {(stock.dividendQuality.status === 'fragile' || stock.dividendQuality.oneOff) && (
+      {(viewStock.dividendQuality.status === 'fragile' || viewStock.dividendQuality.oneOff) && (
         <div className="quality-warning" role="status">
           <ShieldAlert size={16} />
           <span>
-            分红质量{dividendQualityLabel(stock.dividendQuality.status)}：{stock.dividendQuality.notes.join('；') || '质量检查未通过，研究等级封顶L1。'}
+            分红质量{dividendQualityLabel(viewStock.dividendQuality.status)}：{viewStock.dividendQuality.notes.join('；') || '质量检查未通过，研究等级封顶L1。'}
           </span>
         </div>
       )}
@@ -151,21 +179,21 @@ export default function PlanPage({
       <section className="plan-overview">
         <div className="plan-current">
           <span className="eyebrow light">CURRENT POSITION</span>
-          <div><LevelBadge level={stock.level} /><h2>{stock.action}</h2></div>
-          <p>{stock.summary}</p>
-          <div className="current-price-line"><span>当前价 <strong>¥{number(stock.price)}</strong></span><span>预测股息率 <strong>{percent(stock.dividendYield)}</strong></span><span>%B <strong>{number(stock.percentB * 100, 0)}%</strong></span></div>
+          <div><LevelBadge level={viewStock.level} /><h2>{viewStock.action}</h2></div>
+          <p>{viewStock.summary}</p>
+          <div className="current-price-line"><span>当前价 <strong>¥{number(viewStock.price)}</strong></span><span>预测股息率 <strong>{percent(viewStock.dividendYield)}</strong></span><span>%B <strong>{number(viewStock.percentB * 100, 0)}%</strong></span></div>
         </div>
         <div className="budget-control">
           <label htmlFor="budget-range">本次研究预算</label>
           <strong>{compactMoney(budget)}</strong>
-          <input id="budget-range" type="range" min="0" max={maxBudget} step={step} value={budget} onChange={(event) => setBudget(Number(event.target.value))} />
+          <input id="budget-range" type="range" min="0" max={maxBudget} step={step} value={budget} onChange={(event) => changeBudget(Number(event.target.value))} />
           <div className="range-labels"><span>¥0</span><span>可投入 {compactMoney(investable)}</span></div>
           <p>覆盖完整三档参考计划的 <b>{percent(coverage, 0)}</b> · 默认取组合可投入现金 {compactMoney(investable)}</p>
         </div>
       </section>
 
       <section className="ladder-section">
-        <SectionHeading eyebrow="PRICE LADDER" title={`${stock.name} · 三级研究价格`} aside={<span className="outline-tag">{assumption.forecastYear}年预测分红 ¥{number(assumption.dividendPerShare)} / 股</span>} />
+        <SectionHeading eyebrow="PRICE LADDER" title={`${viewStock.name} · 三级研究价格`} aside={<span className="outline-tag">{assumption.forecastYear}年预测分红 ¥{number(assumption.dividendPerShare)} / 股</span>} />
         <div className="ladder-list">
           {plan.map((tier, index) => {
             const allocTier = allocation.tiers[index];

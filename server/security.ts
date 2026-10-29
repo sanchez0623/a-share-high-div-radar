@@ -19,6 +19,33 @@ export function parseAllowedOrigins(raw: string | undefined): string[] {
     .filter((item) => /^https?:\/\/[^/\s]+$/i.test(item));
 }
 
+/** 公开部署的显式声明：反向代理后 HOST 仍可能是回环地址，不能据此免除认证。 */
+export function parsePublicDeployment(raw: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(raw?.trim() ?? '');
+}
+
+/**
+ * 启动前的认证准入检查：返回 null 表示可以启动，否则返回拒绝原因。
+ * 回环监听且未声明公开部署时才允许无令牌运行。
+ */
+export function deploymentAuthError(
+  host: string,
+  accessToken: string,
+  publicDeployment: boolean,
+): string | null {
+  if (accessToken.trim()) return null;
+  if (!publicDeployment && isLoopbackHost(host)) return null;
+  const reason = publicDeployment
+    ? '已声明公开部署（PUBLIC_DEPLOYMENT），但未设置 ACCESS_TOKEN；反向代理后 HOST 仍可能是回环地址，不能作为免认证的依据'
+    : `HOST=${host} 会暴露到本机之外，但未设置 ACCESS_TOKEN`;
+  return [
+    `拒绝启动：${reason}。`,
+    '本服务没有用户隔离（组合、观察仓与全部写接口共用一份数据），',
+    '因此不允许无认证对外提供服务。请设置 ACCESS_TOKEN=... 后重试；',
+    '多人使用请按人一实例部署，切勿共享同一数据目录。',
+  ].join('\n');
+}
+
 /**
  * 是否允许该来源访问 /api。
  * 不带 Origin（同源导航、curl、服务间调用）与回环来源默认放行；

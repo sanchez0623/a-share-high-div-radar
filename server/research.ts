@@ -10,7 +10,7 @@ import type {
   SignalStatus,
   Stock,
 } from '../shared/types.ts';
-import { dividendQualityLabel, researchPrice } from '../shared/assumptions.ts';
+import { dividendQualityBasisLabel, dividendQualityLabel, researchPrice } from '../shared/assumptions.ts';
 import { calculateIndicators, type IndicatorResult } from './indicators.ts';
 import { reaches, round } from './numeric.ts';
 
@@ -156,7 +156,7 @@ function buildSignals(
       key: 'dividend',
       label: '分红质量',
       status: dividendStatus,
-      value: `${dividendQualityLabel(quality.status)} · 覆盖 ${quality.freeCashFlowCoverage.toFixed(2)}×`,
+      value: `${dividendQualityLabel(quality.status)}${quality.basis === 'base' ? `（${dividendQualityBasisLabel(quality.basis)}）` : ''} · 覆盖 ${quality.freeCashFlowCoverage.toFixed(2)}×`,
       description: '派息率、经营与自由现金流覆盖、利润波动与杠杆质量共同决定分红可持续性。',
     },
     {
@@ -248,7 +248,7 @@ function researchAction(stock: Stock): Pick<Stock, 'action' | 'summary'> {
   if (qualityBlocked) {
     return {
       action: '分红质量复核',
-      summary: `达到${stock.level}估值与超跌条件，但${stock.dividendQuality.oneOff ? '预测分红含一次性特别分红' : '现金流覆盖不足'}，研究等级封顶L1。`,
+      summary: `达到${stock.level}估值与超跌条件，但${stock.dividendQuality.oneOff ? '预测分红含一次性特别分红' : '现金流覆盖不足'}，研究等级封顶L1${stock.dividendQuality.basis === 'base' ? '，质量口径为基期质量参考' : ''}。`,
     };
   }
 

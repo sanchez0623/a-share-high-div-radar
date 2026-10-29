@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { PlanTier, PriceBar, ResearchLevel } from '../shared/types.ts';
 import { adjustForExDividend, researchPrice } from '../shared/assumptions.ts';
 import { buildPlanAllocation } from '../shared/allocation.ts';
+import { isIsoCalendarDate } from '../shared/date.ts';
 import {
   hydrateAssumptions,
   previewAssumption,
@@ -10,14 +11,16 @@ import {
   saveAssumption,
 } from './assumptions.ts';
 import { createDemoState } from './demo-data.ts';
+import { buildDividendQuality, type DividendQualityInput } from './dividend-quality.ts';
 import { TradeError } from './errors.ts';
 import { calculateIndicators } from './indicators.ts';
-import { executeTrade, getPortfolio, hydratePortfolio } from './portfolio.ts';
+import { buildAllocation, executeTrade, getPortfolio, hydratePortfolio } from './portfolio.ts';
 import { dispatchReminder } from './reminder.ts';
 import { buildResearchPlan, deriveResearchLevel, SIGNAL_WEIGHTS, analyzeStock } from './research.ts';
 import { round } from './numeric.ts';
 import { RISK_POLICY, deriveRiskEvent, deriveRiskGate } from './risk-model.ts';
 import { addRiskEvent, updateRiskSource, verifyRisk } from './risk-actions.ts';
+import { deploymentAuthError, parsePublicDeployment } from './security.ts';
 import { getStockSnapshot } from './snapshot.ts';
 import { commitPortfolioChange } from './state-change.ts';
 import { reviewTrades } from './trade-review.ts';
@@ -168,6 +171,49 @@ test('临时预览不写入状态也不递增版本', () => {
   assert.equal(resolveAssumption(state, '600941.SH').version, 0);
 });
 
+test('临时预览在隔离副本中重算等级与计划，不混用旧假设', () => {
+  const state = createDemoState();
+  const preview = previewAssumption(state, '600941.SH', {
+    forecastYear: 2026,
+    scenario: 'conservative',
+    requiredYield: 6,
+  });
+
+  /** 快照口径必须是预览假设，而不是缓存里的旧预测与旧门槛。 */
+  assert.equal(preview.stock.forecastDividend, preview.assumption.dividendPerShare);
+  assert.equal(preview.stock.buyThreshold, preview.assumption.requiredYield);
+  assert.equal(preview.stock.assumptionVersion, preview.assumption.version);
+  assert.equal(
+    preview.stock.dividendYield,
+    round((preview.assumption.dividendPerShare / preview.stock.price) * 100),
+  );
+  assert.equal(preview.stock.level, deriveResearchLevel(preview.stock));
+
+  /** 质量检查随预览分红重算：分红下修后现金流覆盖必须同步变化。 */
+  const cached = state.stocks.get('600941.SH')!;
+  assert.notEqual(
+    preview.stock.dividendQuality.freeCashFlowCoverage,
+    cached.dividendQuality.freeCashFlowCoverage,
+  );
+
+  /** 档位解锁与预览等级一致，不再沿用缓存里的旧等级。 */
+  const rank: Record<ResearchLevel, number> = { L0: 0, L1: 1, L2: 2, L3: 3 };
+  for (const tier of preview.plan) {
+    assert.equal(
+      tier.unlocked,
+      rank[preview.stock.level] >= rank[tier.level] &&
+        preview.stock.riskGate.allowedLevels.includes(tier.level),
+    );
+  }
+
+  /** 资金分配按预览价格阶梯计算，股数与费用也随预览价格更新。 */
+  const allocation = buildAllocation(state, preview.stock, preview.plan);
+  assert.deepEqual(
+    allocation.tiers.map((tier) => tier.targetPrice),
+    preview.plan.map((tier) => tier.targetPrice),
+  );
+});
+
 test('重启后按磁盘记录恢复假设版本与研究口径', () => {
   const state = createDemoState();
   const saved = saveAssumption(state, '601088.SH', {
@@ -185,6 +231,11 @@ test('重启后按磁盘记录恢复假设版本与研究口径', () => {
   assert.equal(stock.assumptionVersion, saved.version);
   assert.equal(stock.buyThreshold, 7);
   assert.equal(stock.forecastDividend, saved.dividendPerShare);
+
+  /** 落盘公告日期被改成伪日期时按缺失处理，不把 2026-02-31 展示出去。 */
+  const tampered = createDemoState();
+  hydrateAssumptions(tampered, [{ ...saved, announcementDate: '2026-02-31' }]);
+  assert.equal(resolveAssumption(tampered, '601088.SH').announcementDate, null);
 });
 
 test('中/低风险未关闭时封顶L2，高风险未关闭时全部阻断', () => {
@@ -242,6 +293,23 @@ test('交易校验最小价格、价格步长与舍入后成交金额，失败�
       TradeError,
     );
   }
+  assert.equal(state.cash, 50_000);
+  assert.equal(state.holdings.get('601318.SH')!.shares, 2_000);
+  assert.equal(state.trades.length, 0);
+});
+
+test('卖出净回款不足以覆盖费用时拒绝成交，现金与持仓不变', () => {
+  const state = createDemoState();
+  /** 100股 × 0.01元 = 1元成交金额，佣金最低5元，净回款为负。 */
+  assert.throws(
+    () => executeTrade(state, { symbol: '601318.SH', side: 'sell', shares: 100, price: 0.01 }),
+    /卖出净回款不为正/,
+  );
+  /** 成交金额恰好等于最低佣金时净回款为零，同样不能白送持仓。 */
+  assert.throws(
+    () => executeTrade(state, { symbol: '601318.SH', side: 'sell', shares: 500, price: 0.01 }),
+    /卖出净回款不为正/,
+  );
   assert.equal(state.cash, 50_000);
   assert.equal(state.holdings.get('601318.SH')!.shares, 2_000);
   assert.equal(state.trades.length, 0);
@@ -381,6 +449,197 @@ test('分配只使用已到账现金：预计分红与已宣告待收不计入�
   assert.equal(result.approvedBudget, 40_000);
   assert.ok(result.totalAllocated <= 40_000);
   assert.ok(result.notes.some((n) => n.includes('可投入现金')));
+});
+
+test('全部档位锁定时不分配任何资金：totalShares 为 0 且给出具体阻断原因', () => {
+  const plan: PlanTier[] = [
+    { level: 'L1', name: '初步研究', targetPrice: 100, shares: 100, yieldThreshold: 0.06, estimatedAmount: 10_000, conditions: [], unlocked: false, assumptionVersion: 1 },
+    { level: 'L2', name: '深入复核', targetPrice: 95, shares: 200, yieldThreshold: 0.065, estimatedAmount: 19_000, conditions: [], unlocked: false, assumptionVersion: 1 },
+    { level: 'L3', name: '严格核验', targetPrice: 90, shares: 300, yieldThreshold: 0.07, estimatedAmount: 27_000, conditions: [], unlocked: false, assumptionVersion: 1 },
+  ];
+  const result = buildPlanAllocation({
+    plan,
+    budget: 50_000,
+    availableCash: 60_000,
+    minCashReserve: 10_000,
+    totalAssets: 100_000,
+    stockMarketValue: 0,
+    sectorMarketValue: 0,
+    sector: '银行',
+    maxStockWeight: 30,
+    maxSectorWeight: 50,
+    lockReasons: { L1: '风险闸门阻断L1：高风险未关闭', L2: '分红质量脆弱，封顶L1', L3: '研究条件未达到L3' },
+  });
+
+  /** 页面显示“全部阻断”时，资金计划必须同为 0，不能给出可执行买入。 */
+  assert.equal(result.totalShares, 0);
+  assert.equal(result.totalAllocated, 0);
+  assert.equal(result.totalFees, 0);
+  assert.equal(result.unallocated, result.approvedBudget, '锁定档位不得占用预算');
+  result.tiers.forEach((tier) => {
+    assert.equal(tier.allocatedShares, 0);
+    assert.equal(tier.allocatedAmount, 0);
+    assert.ok(tier.blockers.length > 0, '锁定档位必须给出阻断原因');
+  });
+  assert.deepEqual(
+    result.tiers.map((tier) => tier.blockers[0]),
+    ['风险闸门阻断L1：高风险未关闭', '分红质量脆弱，封顶L1', '研究条件未达到L3'],
+  );
+});
+
+test('部分档位锁定时只对解锁档位分配，锁定档不消耗预算', () => {
+  const plan: PlanTier[] = [
+    { level: 'L1', name: '初步研究', targetPrice: 100, shares: 100, yieldThreshold: 0.06, estimatedAmount: 10_000, conditions: [], unlocked: true, assumptionVersion: 1 },
+    { level: 'L2', name: '深入复核', targetPrice: 95, shares: 200, yieldThreshold: 0.065, estimatedAmount: 19_000, conditions: [], unlocked: false, assumptionVersion: 1 },
+  ];
+  const result = buildPlanAllocation({
+    plan,
+    budget: 50_000,
+    availableCash: 60_000,
+    minCashReserve: 10_000,
+    totalAssets: 100_000,
+    stockMarketValue: 0,
+    sectorMarketValue: 0,
+    sector: '银行',
+    maxStockWeight: 100,
+    maxSectorWeight: 100,
+  });
+
+  assert.equal(result.tiers[0].allocatedShares, 100);
+  assert.equal(result.tiers[1].allocatedShares, 0);
+  assert.equal(result.tiers[1].allocatedAmount, 0);
+  assert.ok(result.tiers[1].blockers.length > 0, '未提供细分原因时仍有兜底说明');
+  assert.equal(result.totalShares, 100);
+});
+
+test('服务端分配按真实快照返回风险、质量与研究条件 blocker，锁定档一律 0 股', () => {
+  const state = createDemoState();
+
+  /** 风险优先：高风险未关闭时全部档位锁定，blocker 指明风险闸门。 */
+  const blockedStock = getStockSnapshot(state, '601088.SH');
+  assert.equal(blockedStock.riskGate.highestOpenSeverity, 'high');
+  const blockedAllocation = buildAllocation(
+    state,
+    blockedStock,
+    buildResearchPlan(blockedStock, resolveAssumption(state, '601088.SH')),
+  );
+  assert.equal(blockedAllocation.totalShares, 0);
+  blockedAllocation.tiers.forEach((tier) => {
+    assert.equal(tier.allocatedShares, 0);
+    assert.ok(
+      tier.blockers.some((reason) => reason.includes('风险闸门阻断')),
+      '高风险阻断必须说明风险原因',
+    );
+  });
+
+  /** 质量封顶：该股预测分红含一次性特别分红，风险清零后仍封顶 L1。 */
+  state.risks = state.risks.filter((risk) => risk.symbol !== '601088.SH');
+  const qualityStock = getStockSnapshot(state, '601088.SH');
+  assert.equal(qualityStock.riskGate.status, 'clear');
+  assert.equal(qualityStock.dividendQuality.oneOff, true);
+  const qualityAllocation = buildAllocation(
+    state,
+    qualityStock,
+    buildResearchPlan(qualityStock, resolveAssumption(state, '601088.SH')),
+  );
+  ['L2', 'L3'].forEach((level) => {
+    const tier = qualityAllocation.tiers.find((item) => item.level === level)!;
+    assert.equal(tier.allocatedShares, 0);
+    assert.ok(
+      tier.blockers.some((reason) => reason.includes('分红质量') && reason.includes('封顶L1')),
+      '质量不达标必须说明质量原因',
+    );
+  });
+
+  /** 研究条件未达：风险全部核验通过且等级为 L0 时，仍不分配任何资金。 */
+  const researchStock = getStockSnapshot(state, '601398.SH');
+  assert.equal(researchStock.riskGate.status, 'verified');
+  assert.equal(researchStock.level, 'L0');
+  const researchAllocation = buildAllocation(
+    state,
+    researchStock,
+    buildResearchPlan(researchStock, resolveAssumption(state, '601398.SH')),
+  );
+  assert.equal(researchAllocation.totalShares, 0);
+  assert.equal(researchAllocation.totalAllocated, 0);
+  researchAllocation.tiers.forEach((tier) => {
+    assert.ok(
+      tier.blockers.some((reason) => reason.includes('研究条件未达到')),
+      '研究条件未满足必须说明原因',
+    );
+  });
+});
+
+test('质量口径与预测年度一致才算对应年度结论，否则标注基期质量参考', () => {
+  const input: DividendQualityInput = {
+    sector: '家用电器',
+    payoutRatio: 62,
+    operatingCashFlowPerShare: 7.2,
+    freeCashFlowPerShare: 5.1,
+    profitVolatility: 12,
+    debtRatio: 62.3,
+    oneOff: false,
+    dataYear: 2026,
+  };
+
+  /** 口径年度与预测年度一致：按对应年度结论呈现。 */
+  const matching = buildDividendQuality(input, 4, 2026);
+  assert.equal(matching.basis, 'matching');
+  assert.equal(matching.dataYear, 2026);
+  assert.ok(!matching.notes.some((note) => note.includes('基期质量参考')));
+  assert.equal(matching.checks.find((check) => check.key === 'payout')!.value, '62%（2026年报）');
+
+  /** 预测年度后移：口径仍取自基期，必须显式标注并说明缺失组成。 */
+  const base = buildDividendQuality(input, 4, 2027);
+  assert.equal(base.basis, 'base');
+  assert.match(base.notes[0], /基期质量参考/);
+  assert.match(base.notes[0], /2026年基期数据/);
+  assert.match(base.notes[0], /2027年尚缺对应 EPS、现金流与一次性分红组成/);
+  assert.match(base.notes[0], /不能直接视为2027年度质量结论/);
+
+  /** 未标注年度归属的口径同样不能冒充对应年度结论。 */
+  const unknown = buildDividendQuality(
+    {
+      sector: '家用电器',
+      payoutRatio: 62,
+      operatingCashFlowPerShare: 7.2,
+      freeCashFlowPerShare: 5.1,
+      profitVolatility: 12,
+      debtRatio: 62.3,
+      oneOff: false,
+    },
+    4,
+    2026,
+  );
+  assert.equal(unknown.basis, 'base');
+  assert.equal(unknown.dataYear, null);
+  assert.match(unknown.notes[0], /基期质量参考/);
+});
+
+test('跨年度预测的质量结论降级为基期质量参考并随口径标注', () => {
+  const state = createDemoState();
+
+  /** 基准预测年度与质量口径一致：按对应年度口径呈现，无基期标注。 */
+  const baseStock = state.stocks.get('601318.SH')!;
+  assert.equal(baseStock.dividendQuality.basis, 'matching');
+  assert.equal(baseStock.dividendQuality.dataYear, 2026);
+  assert.ok(!baseStock.dividendQuality.notes.some((note) => note.includes('基期质量参考')));
+
+  /** 预测年度改为 2028：覆盖率虽按新预测重算，结论必须标注为基期质量参考。 */
+  const preview = previewAssumption(state, '601318.SH', {
+    forecastYear: 2028,
+    scenario: 'base',
+    requiredYield: 5.5,
+  });
+  const quality = preview.stock.dividendQuality;
+  assert.equal(quality.basis, 'base');
+  assert.equal(quality.dataYear, 2026);
+  assert.match(quality.notes[0], /基期质量参考/);
+  assert.match(quality.notes[0], /2028年尚缺对应 EPS、现金流与一次性分红组成/);
+  assert.match(quality.checks.find((check) => check.key === 'payout')!.value, /2026年报/);
+
+  /** 口径标注不改变既有封顶规则：等级仍由同一规则派生。 */
+  assert.equal(preview.stock.level, deriveResearchLevel(preview.stock));
 });
 
 test('初始观察仓研究结论符合演示设定，快照读取不写入冷却', () => {
@@ -545,6 +804,87 @@ test('分红下修同步影响雷达、计划与组合预测', () => {
   assert.equal(position.forecastDividend, afterStock.forecastDividend);
   assert.equal(position.forecastSource, 'assumption');
   assert.equal(position.forecastYear, 2026);
+});
+
+test('历史分红按除息日权益股数追溯：除息后买入不享有，卖出不改写', () => {
+  const state = createDemoState();
+  /** 平安初始持仓 2000 股；已到账除息日 2026-09-10，已宣告待收除息日 2026-10-15。 */
+  const flowsOf = () =>
+    getPortfolio(state).dividendFlows.filter((flow) => flow.symbol === '601318.SH');
+
+  /** 演示行情日 2026-10-23 晚于两个除息日：买入不得追溯历史分红。 */
+  executeTrade(state, { symbol: '601318.SH', side: 'buy', shares: 500, price: 48.6 });
+  let received = flowsOf().find((flow) => flow.stage === 'received')!;
+  let declared = flowsOf().find((flow) => flow.stage === 'declared')!;
+  assert.equal(received.shares, 2000);
+  assert.equal(declared.shares, 2000);
+  assert.equal(received.year, 2026);
+  assert.equal(declared.year, 2026);
+
+  /** 除息后的卖出只影响当前持仓，不改写历史应收金额。 */
+  executeTrade(state, { symbol: '601318.SH', side: 'sell', shares: 500, price: 48.6 });
+  received = flowsOf().find((flow) => flow.stage === 'received')!;
+  declared = flowsOf().find((flow) => flow.stage === 'declared')!;
+  assert.equal(received.shares, 2000);
+  assert.equal(declared.shares, 2000);
+
+  /** 除息日之前成交的买入计入登记在册的权益股数。 */
+  executeTrade(state, {
+    symbol: '601318.SH',
+    side: 'buy',
+    shares: 300,
+    price: 48.6,
+    executedAt: '2026-09-01',
+  });
+  received = flowsOf().find((flow) => flow.stage === 'received')!;
+  declared = flowsOf().find((flow) => flow.stage === 'declared')!;
+  assert.equal(received.shares, 2300);
+  assert.equal(declared.shares, 2300);
+});
+
+test('预测年度只扣除同年度已派与待派，跨年不重复抵扣同一笔分红', () => {
+  const state = createDemoState();
+  /** 演示行情日买入移动（2026-10-23 晚于其除息日 2026-09-18）：不追溯已到账分红。 */
+  executeTrade(state, { symbol: '600941.SH', side: 'buy', shares: 200, price: 104.8 });
+
+  /** 默认预测年度 2026：已到账 4.20 归属 2026，预计 = 4.65 − 4.20 = 0.45。 */
+  const defaultFlows = getPortfolio(state).dividendFlows.filter(
+    (flow) => flow.symbol === '600941.SH',
+  );
+  assert.equal(defaultFlows.find((flow) => flow.stage === 'received'), undefined);
+  const defaultProjected = defaultFlows.find((flow) => flow.stage === 'projected')!;
+  assert.equal(defaultProjected.year, 2026);
+  assert.equal(defaultProjected.shares, 200);
+  assert.equal(defaultProjected.dividendPerShare, 0.45);
+
+  /** 预测年度改为 2027：2026 年的已到账分红不得跨年抵扣，预计等于完整 2027 预测。 */
+  saveAssumption(state, '600941.SH', {
+    forecastYear: 2027,
+    scenario: 'base',
+    requiredYield: 6,
+  });
+  const stock = state.stocks.get('600941.SH')!;
+  const flows = getPortfolio(state).dividendFlows.filter((flow) => flow.symbol === '600941.SH');
+  const projected = flows.find((flow) => flow.stage === 'projected')!;
+  assert.equal(projected.year, 2027);
+  assert.equal(projected.dividendPerShare, stock.forecastDividend);
+  assert.ok(projected.dividendPerShare > defaultProjected.dividendPerShare);
+});
+
+test('未来 12 个月到账与预测年度分红分离：已到账不计入未来口径', () => {
+  const state = createDemoState();
+  const portfolio = getPortfolio(state);
+  const flows = portfolio.dividendFlows.filter((flow) => flow.symbol === '601318.SH');
+
+  /** 平安预测 2.85 低于同年度已派 2.55 + 待派 0.95：预计部分为负，不得生成流水。 */
+  assert.equal(flows.find((flow) => flow.stage === 'projected'), undefined);
+  const receivedNet = flows.find((flow) => flow.stage === 'received')!.netAmount;
+  const declaredNet = flows.find((flow) => flow.stage === 'declared')!.netAmount;
+
+  /** 未来 12 个月只含已宣告待收；已到账是过去的现金流，不进入未来口径。 */
+  assert.equal(portfolio.nextTwelveMonthDividendAfterTax, declaredNet);
+  assert.ok(declaredNet < receivedNet);
+  assert.ok(portfolio.annualDividendAfterTax > portfolio.nextTwelveMonthDividendAfterTax);
 });
 
 test('单条核验只关闭自身，不会把同股票其他风险视为完成', () => {
@@ -1067,4 +1407,60 @@ test('hydratePortfolio 过滤无效代码与非法交易记录，空记录保留
   /** 持仓字段由账本派生。 */
   assert.equal(getStockSnapshot(state, '601318.SH').holdingShares, 50);
   assert.equal(state.holdings.get('601318.SH')!.shares, 50);
+});
+
+test('成交日期必须是真实日历日期，非法值直接拒绝且不改动账本', () => {
+  assert.equal(isIsoCalendarDate('2026-10-23'), true);
+  assert.equal(isIsoCalendarDate('2024-02-29'), true);
+  assert.equal(isIsoCalendarDate('2026-02-31'), false);
+  assert.equal(isIsoCalendarDate('2026-13-01'), false);
+  assert.equal(isIsoCalendarDate('2026-2-3'), false);
+  assert.equal(isIsoCalendarDate('2026-10-23 '), false);
+  assert.equal(isIsoCalendarDate(null), false);
+
+  const state = createDemoState();
+  const cashBefore = state.cash;
+  const sharesBefore = state.holdings.get('601318.SH')!.shares;
+  assert.throws(
+    () =>
+      executeTrade(state, {
+        symbol: '601318.SH',
+        side: 'buy',
+        shares: 100,
+        price: 48.6,
+        executedAt: '2026-02-31',
+      }),
+    (error: unknown) => error instanceof TradeError,
+  );
+  /** 拒绝发生在记账之前：现金、持仓与账本都必须保持原样。 */
+  assert.equal(state.cash, cashBefore);
+  assert.equal(state.holdings.get('601318.SH')!.shares, sharesBefore);
+  assert.equal(state.trades.length, 0);
+
+  /** 缺省成交日期仍按行情日记录，这是显式缺省而不是对非法输入的替换。 */
+  const traded = executeTrade(state, {
+    symbol: '601318.SH',
+    side: 'buy',
+    shares: 100,
+    price: 48.6,
+  });
+  assert.equal(traded.trades[0].executedAt, '2026-10-23');
+});
+
+test('公开部署必须显式声明并配置访问令牌', () => {
+  assert.equal(parsePublicDeployment('true'), true);
+  assert.equal(parsePublicDeployment('TRUE'), true);
+  assert.equal(parsePublicDeployment('on'), true);
+  assert.equal(parsePublicDeployment('0'), false);
+  assert.equal(parsePublicDeployment(undefined), false);
+
+  /** 回环监听且未声明公开部署：允许无令牌运行（本机开发）。 */
+  assert.equal(deploymentAuthError('127.0.0.1', '', false), null);
+  assert.equal(deploymentAuthError('localhost', '   ', false), null);
+  /** 反向代理下 HOST 仍是回环地址：声明公开部署后必须配置令牌。 */
+  assert.match(deploymentAuthError('127.0.0.1', '', true) ?? '', /ACCESS_TOKEN/);
+  assert.equal(deploymentAuthError('127.0.0.1', 'token', true), null);
+  /** 非回环监听无论是否声明公开部署都需要令牌。 */
+  assert.match(deploymentAuthError('0.0.0.0', '', false) ?? '', /ACCESS_TOKEN/);
+  assert.equal(deploymentAuthError('0.0.0.0', 'token', false), null);
 });

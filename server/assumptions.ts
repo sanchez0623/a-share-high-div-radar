@@ -4,6 +4,7 @@ import type {
   DividendForecast,
   ForecastSource,
   PlanTier,
+  Stock,
 } from '../shared/types.ts';
 import {
   REQUIRE_YIELD_MAX,
@@ -14,10 +15,11 @@ import {
   isForecastSource,
   projectedDividendPerShare,
 } from '../shared/assumptions.ts';
+import { isIsoCalendarDate } from '../shared/date.ts';
 import { buildDividendQuality } from './dividend-quality.ts';
 import { AssumptionError } from './errors.ts';
 import { buildResearchPlan } from './research.ts';
-import { getStockSnapshot } from './snapshot.ts';
+import { getSnapshotFromStock } from './snapshot.ts';
 import type { DemoState } from './state.ts';
 
 /** 校验并规范化客户端提交的假设输入。 */
@@ -119,35 +121,49 @@ export function resolveAssumption(state: DemoState, symbol: string): DividendAss
   };
 }
 
-/** 临时预览：按同一公式计算，但不写入状态、不递增版本。 */
+/** 把假设投影到股票研究口径上：预测分红、门槛、版本与质量检查同步替换。 */
+function withAssumption(
+  state: DemoState,
+  stock: Stock,
+  assumption: DividendAssumption,
+): Stock {
+  const qualityInput = state.qualityInputs.get(assumption.symbol);
+  return {
+    ...stock,
+    forecastDividend: assumption.dividendPerShare,
+    buyThreshold: assumption.requiredYield,
+    assumptionVersion: assumption.version,
+    dividendForecast: forecastFromAssumption(assumption),
+    /** 分红下修会改变现金流覆盖，质量检查必须随预测同步重算；
+     *  预测年度与基期口径不一致时，结论自动降级为“基期质量参考”。 */
+    dividendQuality: qualityInput
+      ? buildDividendQuality(qualityInput, assumption.dividendPerShare, assumption.forecastYear)
+      : stock.dividendQuality,
+  };
+}
+
+/**
+ * 临时预览：在隔离副本中完整重算“假设 → 质量 → 等级 → 计划”，
+ * 不写入状态、不递增版本，也绝不沿用缓存里的旧预测与旧等级。
+ */
 export function previewAssumption(
   state: DemoState,
   symbol: string,
   input: AssumptionInput,
   now = Date.now(),
-): { assumption: DividendAssumption; plan: PlanTier[] } {
-  if (!state.stocks.has(symbol)) throw new AssumptionError('未知股票代码');
+): { assumption: DividendAssumption; stock: Stock; plan: PlanTier[] } {
+  const current = state.stocks.get(symbol);
+  if (!current) throw new AssumptionError('未知股票代码');
   const assumption = composeAssumption(state, symbol, input, null);
-  /** 档位解锁使用当前纯计算快照，避免读取股票缓存里可能过期的研究等级。 */
-  return { assumption, plan: buildResearchPlan(getStockSnapshot(state, symbol, now), assumption) };
+  const stock = getSnapshotFromStock(state, symbol, withAssumption(state, current, assumption), now);
+  return { assumption, stock, plan: buildResearchPlan(stock, assumption) };
 }
 
 function applyAssumption(state: DemoState, assumption: DividendAssumption): void {
   state.assumptions.set(assumption.symbol, assumption);
   const stock = state.stocks.get(assumption.symbol);
   if (!stock) return;
-  const qualityInput = state.qualityInputs.get(assumption.symbol);
-  state.stocks.set(assumption.symbol, {
-    ...stock,
-    forecastDividend: assumption.dividendPerShare,
-    buyThreshold: assumption.requiredYield,
-    assumptionVersion: assumption.version,
-    dividendForecast: forecastFromAssumption(assumption),
-    /** 分红下修会改变现金流覆盖，质量检查必须随预测同步重算。 */
-    dividendQuality: qualityInput
-      ? buildDividendQuality(qualityInput, assumption.dividendPerShare)
-      : stock.dividendQuality,
-  });
+  state.stocks.set(assumption.symbol, withAssumption(state, stock, assumption));
 }
 
 /** 保存正式假设：同步写回股票的研究口径，返回新版本。 */
@@ -198,8 +214,9 @@ export function hydrateAssumptions(state: DemoState, records: DividendAssumption
       ...record,
       source,
       sourceDetail,
-      announcementDate:
-        typeof record.announcementDate === 'string' ? record.announcementDate : null,
+      announcementDate: isIsoCalendarDate(record.announcementDate)
+        ? record.announcementDate
+        : null,
       reportPeriod:
         typeof record.reportPeriod === 'string' && record.reportPeriod.length > 0
           ? record.reportPeriod

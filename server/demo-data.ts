@@ -255,6 +255,8 @@ const STOCK_SEEDS: StockSeed[] = [
 function qualityInputOf(seed: StockSeed): DividendQualityInput {
   return {
     sector: seed.sector,
+    /** 演示质量口径与基准预测年度（FORECAST_BASE_YEAR）对齐；真实数据源应传报告年度。 */
+    dataYear: FORECAST_BASE_YEAR,
     payoutRatio: seed.payoutRatio,
     operatingCashFlowPerShare: seed.quality.operatingCashFlowPerShare,
     freeCashFlowPerShare: seed.quality.freeCashFlowPerShare,
@@ -489,7 +491,11 @@ export function createDemoState(now = Date.now()): DemoState {
         ),
       },
       baseForecast: { ...seed.forecast },
-      dividendQuality: buildDividendQuality(qualityInputOf(seed), seed.forecastDividend),
+      dividendQuality: buildDividendQuality(
+        qualityInputOf(seed),
+        seed.forecastDividend,
+        FORECAST_BASE_YEAR,
+      ),
       valuationBasis: { ...seed.valuationBasis },
       marketData: {
         quoteTime: DATA_META.quoteTime,

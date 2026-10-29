@@ -1,4 +1,4 @@
-import type { PlanAllocation, PlanAllocationTier, PlanTier } from './types.ts';
+import type { PlanAllocation, PlanAllocationTier, PlanTier, ResearchLevel } from './types.ts';
 import { estimateTradeFees } from './costs.ts';
 import { roundTo } from './assumptions.ts';
 
@@ -30,7 +30,12 @@ export interface PlanAllocationInput {
   sector: string;
   maxStockWeight: number;
   maxSectorWeight: number;
+  /** 未解锁档位的具体原因（风险/质量/研究条件），由调用方按股票级结论提供。 */
+  lockReasons?: Partial<Record<ResearchLevel, string>>;
 }
+
+/** 未解锁档位的兜底说明：即使调用方没有提供细分原因，也绝不再分配资金。 */
+const DEFAULT_LOCK_REASON = '研究条件未满足，档位处于锁定状态，本档不分配资金';
 
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -101,7 +106,10 @@ export function buildPlanAllocation(input: PlanAllocationInput): PlanAllocation 
     let allocatedAmount = 0;
     let allocatedFee = 0;
 
-    if (!(price > 0)) {
+    if (!tier.unlocked) {
+      /** 风险闸门、分红质量或研究条件未满足：锁定的档位一律 0 股，不占用预算。 */
+      blockers.push(input.lockReasons?.[tier.level] ?? DEFAULT_LOCK_REASON);
+    } else if (!(price > 0)) {
       blockers.push('研究价格缺失，无法计算分配股数');
     } else if (approvedBudget <= 0) {
       blockers.push('本次可投入预算为 0，需先释放现金或调低最低储备');

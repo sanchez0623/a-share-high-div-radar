@@ -10,6 +10,7 @@ import {
   FORECAST_YEARS,
   SCENARIOS,
   buildForecastHypothesis,
+  dividendQualityBasisLabel,
   dividendQualityLabel,
   forecastSourceLabel,
   latestDividendGrowth,
@@ -181,7 +182,7 @@ export default function DividendLab({ detail, stocks, onSelect, onSave, onPrevie
 
       <section className="lab-bottom-grid">
         <div className="panel">
-          <SectionHeading eyebrow="QUALITY CHECK" title="高股息，先要能持续" aside={<span className="outline-tag">分红质量 {dividendQualityLabel(quality.status)}</span>} />
+          <SectionHeading eyebrow="QUALITY CHECK" title="高股息，先要能持续" aside={<span className="outline-tag">{dividendQualityBasisLabel(quality.basis)} · 分红质量 {dividendQualityLabel(quality.status)}</span>} />
           <div className="quality-metrics">
             <div><span>派息率（年报）</span><strong>{percent(quality.payoutRatio, 0)}</strong><div className="quality-track"><i style={{ width: `${Math.min(quality.payoutRatio, 100)}%` }} /></div><small>{quality.checks[0].detail}</small></div>
             <div><span>自由现金流覆盖</span><strong>{number(quality.freeCashFlowCoverage)}<i>×</i></strong><small>经营现金流覆盖 {number(quality.operatingCashFlowCoverage)}×</small></div>

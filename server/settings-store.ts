@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { PersistenceError } from './errors.ts';
 
 /**
  * 尚未形成正式假设时的用户设置。
@@ -29,19 +30,38 @@ export function createMemorySettingsStore(initial: PersistedSettings | null = nu
 export function createFileSettingsStore(filePath: string): SettingsStore {
   return {
     load() {
+      let raw: string;
       try {
-        const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<PersistedSettings>;
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-        const thresholds = parsed.buyThresholds;
-        if (!thresholds || typeof thresholds !== 'object' || Array.isArray(thresholds)) return null;
-        return { buyThresholds: thresholds as Record<string, number> };
+        raw = readFileSync(filePath, 'utf8');
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') {
-          console.warn(`读取设置文件失败，将使用演示默认门槛：${(error as Error).message}`);
-        }
-        return null;
+        /** 只有文件不存在才是首次启动；其余（权限、磁盘错误等）一律拒绝启动。 */
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw new PersistenceError(
+          `无法读取设置文件 ${filePath}：${(error as Error).message}`,
+        );
       }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        throw new PersistenceError(
+          `设置文件 ${filePath} 的 JSON 解析失败：${(error as Error).message}`,
+        );
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new PersistenceError(
+          `设置文件 ${filePath} 格式无效：根节点必须为 JSON 对象`,
+        );
+      }
+      const thresholds = (parsed as { buyThresholds?: unknown }).buyThresholds;
+      if (!thresholds || typeof thresholds !== 'object' || Array.isArray(thresholds)) {
+        throw new PersistenceError(
+          `设置文件 ${filePath} 格式无效：buyThresholds 必须为对象`,
+        );
+      }
+      return { buyThresholds: thresholds as Record<string, number> };
     },
     save(settings) {
       mkdirSync(dirname(filePath), { recursive: true });

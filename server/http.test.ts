@@ -704,6 +704,60 @@ test('风险文件存在但为空时按空状态恢复，不回退演示种子',
   }
 });
 
+test('假设文件损坏时拒绝启动，且不覆盖原文件', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-assumption-broken-'));
+  const file = join(directory, 'assumptions.json');
+  const broken = '{"version":1,"items":[';
+  writeFileSync(file, broken, 'utf8');
+
+  try {
+    assert.throws(
+      () => createApp(createDemoState(), createFileAssumptionStore(file)),
+      /分红假设文件/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), broken);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('组合状态文件损坏时拒绝启动，且不覆盖原文件', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-portfolio-broken-'));
+  const file = join(directory, 'portfolio.json');
+  const broken = '{"version":1,"watchlist":';
+  writeFileSync(file, broken, 'utf8');
+
+  try {
+    assert.throws(
+      () => createApp(createDemoState(), undefined, undefined, createFilePortfolioStore(file)),
+      /组合状态文件/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), broken);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('设置文件损坏时拒绝启动，且不覆盖原文件', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-settings-broken-'));
+  const file = join(directory, 'settings.json');
+  const broken = '{"version":1,"buyThresholds"';
+  writeFileSync(file, broken, 'utf8');
+
+  try {
+    assert.throws(
+      () =>
+        createApp(createDemoState(), undefined, undefined, undefined, {
+          settingsStore: createFileSettingsStore(file),
+        }),
+      /设置文件/,
+    );
+    assert.equal(readFileSync(file, 'utf8'), broken);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('默认拒绝非本机来源，回环来源按原样放行', async () => {
   const denied = await fetch(`${baseUrl}/api/dashboard`, {
     headers: { Origin: 'https://evil.example' },

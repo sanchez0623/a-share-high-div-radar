@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DividendAssumption } from '../shared/types.ts';
+import { PersistenceError } from './errors.ts';
 
 export interface AssumptionStore {
   load(): DividendAssumption[];
@@ -21,16 +22,38 @@ export function createMemoryAssumptionStore(initial: DividendAssumption[] = []):
 export function createFileAssumptionStore(filePath: string): AssumptionStore {
   return {
     load() {
+      let raw: string;
       try {
-        const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as { items?: unknown };
-        return Array.isArray(parsed.items) ? (parsed.items as DividendAssumption[]) : [];
+        raw = readFileSync(filePath, 'utf8');
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') {
-          console.warn(`读取分红假设文件失败，将使用默认假设：${(error as Error).message}`);
-        }
-        return [];
+        /** 只有文件不存在才是首次启动；其余（权限、磁盘错误等）一律拒绝启动。 */
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw new PersistenceError(
+          `无法读取分红假设文件 ${filePath}：${(error as Error).message}`,
+        );
       }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        throw new PersistenceError(
+          `分红假设文件 ${filePath} 的 JSON 解析失败：${(error as Error).message}`,
+        );
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new PersistenceError(
+          `分红假设文件 ${filePath} 格式无效：根节点必须为 JSON 对象`,
+        );
+      }
+      const items = (parsed as { items?: unknown }).items;
+      if (!Array.isArray(items)) {
+        throw new PersistenceError(
+          `分红假设文件 ${filePath} 格式无效：items 必须为数组`,
+        );
+      }
+      return items as DividendAssumption[];
     },
     save(items) {
       mkdirSync(dirname(filePath), { recursive: true });

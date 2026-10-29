@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { PersistedPortfolio } from '../shared/types.ts';
+import { PersistenceError } from './errors.ts';
 
 export interface PortfolioStore {
   load(): PersistedPortfolio | null;
@@ -23,17 +24,33 @@ export function createMemoryPortfolioStore(
 export function createFilePortfolioStore(filePath: string): PortfolioStore {
   return {
     load() {
+      let raw: string;
       try {
-        const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<PersistedPortfolio>;
-        if (!parsed || typeof parsed !== 'object') return null;
-        return parsed as PersistedPortfolio;
+        raw = readFileSync(filePath, 'utf8');
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') {
-          console.warn(`读取组合状态文件失败，将使用演示初始状态：${(error as Error).message}`);
-        }
-        return null;
+        /** 只有文件不存在才是首次启动；其余（权限、磁盘错误等）一律拒绝启动。 */
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw new PersistenceError(
+          `无法读取组合状态文件 ${filePath}：${(error as Error).message}`,
+        );
       }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        throw new PersistenceError(
+          `组合状态文件 ${filePath} 的 JSON 解析失败：${(error as Error).message}`,
+        );
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new PersistenceError(
+          `组合状态文件 ${filePath} 格式无效：根节点必须为 JSON 对象`,
+        );
+      }
+      /** 记录级合法性（观察仓、持仓、交易）由 hydratePortfolio 统一校验。 */
+      return parsed as PersistedPortfolio;
     },
     save(state) {
       mkdirSync(dirname(filePath), { recursive: true });

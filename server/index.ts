@@ -5,7 +5,7 @@ import { createFileAssumptionStore } from './assumption-store.ts';
 import { createFileSettingsStore } from './settings-store.ts';
 import { createFileRiskStore } from './risk-store.ts';
 import { createFilePortfolioStore } from './portfolio-store.ts';
-import { RiskPersistenceError } from './errors.ts';
+import { PersistenceError, RiskPersistenceError } from './errors.ts';
 import { DEFAULT_HOST, deploymentAuthError, isLoopbackHost, parseAllowedOrigins, parsePublicDeployment } from './security.ts';
 import { activateLiveMeta, AS_OF, DATA_META } from './config.ts';
 import { createDemoState } from './demo-data.ts';
@@ -181,14 +181,16 @@ async function start(): Promise<void> {
       { serveStatic: !apiOnly, allowedOrigins, accessToken, quoteService, settingsStore: createFileSettingsStore(settingsFile) },
     );
   } catch (error) {
-    if (error instanceof RiskPersistenceError) {
+    if (error instanceof PersistenceError) {
       console.error(
         [
-          '拒绝启动：风险核验数据无法安全恢复（文件损坏或不可读）。',
+          error instanceof RiskPersistenceError
+            ? '拒绝启动：风险核验数据无法安全恢复（文件损坏或不可读）。'
+            : '拒绝启动：研究数据无法安全恢复（文件损坏或不可读）。',
           `原因：${error.message}`,
-          '为避免用演示种子覆盖原文件，服务不会启动，也不会写入任何数据。',
-          `请先备份 ${riskFile}，修复或用可信备份替换后重试；`,
-          '如确认放弃历史风险记录，请手工移走该文件，让服务以演示种子首次启动。',
+          '为避免用演示状态覆盖原文件，服务不会启动，也不会写入任何数据。',
+          '请先备份 server/.data 下对应文件，修复或用可信备份替换后重试；',
+          '如确认放弃该文件内容，请手工移走它，让服务以演示状态重新初始化。',
         ].join('\n'),
       );
       process.exit(1);

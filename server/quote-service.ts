@@ -64,8 +64,11 @@ function chunk(items: string[], size: number): string[][] {
 }
 
 export interface QuoteServiceOptions {
-  /** 展示层的数据模式（当前与 DATA_META.dataMode 一致；P1 接真实日线后切换 live）。 */
-  dataMode: DataMode;
+  /**
+   * 展示层的数据模式。传函数以动态读取（live 切换发生在启动装配阶段，
+   * 晚于 service 构造，静态值会把 demo 快照进响应）。
+   */
+  dataMode: () => DataMode;
   /** 源降级顺序，第一个为主源。 */
   fallbackOrder: QuoteSource[];
   /** 盘中缓存 TTL；必须小于前端轮询间隔，否则缓存形同虚设。 */
@@ -238,7 +241,7 @@ export function createQuoteService(
         };
       });
 
-    return { dataMode: options.dataMode, sessionState: session, quotes, degraded: lastDegraded };
+    return { dataMode: options.dataMode(), sessionState: session, quotes, degraded: lastDegraded };
   }
 
   return { getSnapshot, refresh };

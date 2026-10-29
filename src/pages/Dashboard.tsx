@@ -60,7 +60,7 @@ export default function Dashboard({ data, onSelect, onManage, liveQuotes }: Prop
       </section>
 
       <div className="data-ribbon">
-        <div><FlaskConical size={16} /><strong>演示研究环境</strong><span>{data.dataNotice}</span></div>
+        <div><FlaskConical size={16} /><strong>{data.dataMode === 'live' ? '真实行情' : '演示研究环境'}</strong><span>{data.dataNotice}</span></div>
         <QuoteStatusBadge snapshot={liveQuotes.snapshot} error={liveQuotes.error} />
         <div><Database size={15} />行情 {data.dataMeta.quoteTime}<span className="ribbon-divider" />{data.dataMeta.priceAdjustment === 'forward' ? '前复权' : '不复权'}口径 · PE {statBasisLabel(data.dataMeta.peBasis)} · ROE {statBasisLabel(data.dataMeta.roeBasis)}</div>
       </div>

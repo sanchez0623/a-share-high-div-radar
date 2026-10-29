@@ -785,10 +785,16 @@ export function useLiveQuotes(symbols: string[], enabled: boolean) {
 | P0 | `src/components/QuoteBadge.tsx` | `QuoteBadge`（单只：价格/涨跌/时效）+ `QuoteStatusBadge`（仓级：时段/来源/降级/陈旧数） | ✅ 已完成 |
 | P0 | `src/pages/Dashboard.tsx`、`src/pages/StockDetail.tsx`、`src/App.tsx`、`src/styles.css` | App 层统一轮询，ribbon 仓级摘要 + 详情页单只徽章 | ✅ 已完成 |
 | P0 | `scripts/live-quote-probe.ts` | 三源冒烟探针（示例，未接入主流程；已改为直接复用真实 provider，兼作端到端验证工具） | ✅ 已完成 |
-| P1 | `server/providers/ifind.ts` | iFinD 适配（HTTP API 或 MCP 网关） | 新增 |
-| P1 | `server/providers/tushare.ts` | Tushare `rt_k` 适配（需 token） | 新增 |
-| P1 | `server/bar-store.ts` | 日线持久化（`.data/bars/`） | 新增 |
-| P1 | `server/quote-store.ts` | `quotes-latest.json` 原子写 + 重启预热 | 新增 |
+| P1 | `server/providers/kline-eastmoney.ts` | 东财 push2his 前复权日线（实测确认：末根即今日实时值，fqt=1 免自算除息） | ✅ 已完成（实测通过） |
+| P1 | `server/bar-store.ts` | 日线原子持久化（`.data/bars/`）+ `applyQuoteToHistory`（方案 A 实时价覆盖当日 bar） | ✅ 已完成（6 个单测通过） |
+| P1 | `server/quote-store.ts` | `quotes-latest.json` 原子写 + 重启预热（seed 注入，expiresAt=0 优先拉新、失败降级） | ✅ 已完成（实测通过） |
+| P1 | `server/config.ts` | `activateLiveMeta` / `getDataNotice`：启动装配成功后就地切 live，失败自动回退 demo（fail-safe） | ✅ 已完成（实测通过） |
+| P1 | `server/index.ts` | 装配：kline→histories→bars→live 切换；`onUpdate` 实时价进派生链；收盘固化；`dataMode` 动态读取 | ✅ 已完成（端到端实测：6 只价格/指标全部真实化） |
+| P1 | `server/quote-service.ts` | `onUpdate` / `seed` 钩子 + `dataMode` 改为动态函数（修复 live 切换后 /api/quotes 仍报 demo） | ✅ 已完成 |
+| P1 | `server/quote-scheduler.ts` | `onSessionClosed` 收盘边沿回调（open→非 open 触发一次固化） | ✅ 已完成 |
+| P1 | `server/providers/ifind.ts`、`tushare.ts` | iFinD / Tushare `rt_k` 适配 | ⏸ 未实施：依赖用户凭证（IFIND token / TUSHARE token），当前免费三源已满足需求，接入前先补探针验证 |
+| P1 | `src/App.tsx`、`src/pages/Dashboard.tsx` | 侧边栏/数据条文案按 `dataMode` 切换（真实行情已连接 vs 演示快照已连接） | ✅ 已完成 |
+| P1 | `server/quote-live.test.ts` | `applyQuoteToHistory` 覆盖/追加/停牌残留/时区 6 个用例 | ✅ 已完成（npm test 90/90） |
 | P2 | `server/routes/quotes-stream.ts` | SSE 推送 | 新增 |
 | P2 | `server/quote-store.ts` | 可选 SQLite 迁移 | 扩展 |
 

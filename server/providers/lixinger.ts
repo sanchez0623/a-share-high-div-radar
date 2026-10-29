@@ -8,8 +8,8 @@ import { normalizeSymbol } from '../../shared/quote-types.ts';
  * - POST /company/fundamental/non_financial {token, stockCodes:["601318"], metricsList, date}
  *   → [{"date","dyr":0.0513,"pb":0.9224,"pe_ttm":9.7733,"stockCode":"601318"}]
  *   （pe_ttm 与腾讯 f39 一致；dyr 为近12月股息率小数）
- * - POST /company/dividend {token, stockCode:"601318", metricsList:["dividendYield","exRightDate"]}
- *   （实测返回空数组，疑似需要日期范围参数，接入时再验证）
+ * - POST /company/dividend：参数 token/stockCode/startDate(必选)/endDate/limit，无 metricsList
+ *   （详见 fetchDividendEvents 注释与官方文档）
  * 限流：官方 1000 次/分、36 次/秒；本模块保守串行 + 1.1s 最小间隔。
  */
 
@@ -94,27 +94,69 @@ export async function fetchFundamental(symbol: string, signal?: AbortSignal): Pr
   };
 }
 
-/** 分红/除权日历史（备用；实测需带日期范围参数，接入前先验证）。 */
-export async function fetchDividendYieldHistory(
+/**
+ * 分红事件（官方文档 https://www.lixinger.com/api/open-api/html-doc/cn/company/dividend）：
+ * POST /company/dividend {token, stockCode, startDate(必选), endDate?, limit?}——无 metricsList。
+ * 实测（2026-10-29，601318，5年）：10 条事件，每股分红、派息率、登记/除权/到账日、送转股齐全，
+ * 比 fqkline 免费路线（仅每股派息+登记/除权日）更完整，是分红史/派息率口径的首选备用源。
+ * 时间间隔不超过 10 年。
+ */
+export interface LixingerDividendEvent {
+  /** 公告日期。 */
+  announceDate: string;
+  /** 财报期末（如 2022-12-31）。 */
+  fsEndDate: string;
+  currency: string;
+  /** 股权登记日。 */
+  registerDate: string | null;
+  /** 除权除息日。 */
+  exDate: string | null;
+  /** 分红到账日。 */
+  paymentDate: string | null;
+  /** 每股分红（元；不含送转股）。 */
+  perShare: number;
+  /** 每10股送股（股）。 */
+  bonusSharesFromProfit: number;
+  /** 每10股转增（股）。 */
+  bonusSharesFromCapitalReserve: number;
+  /** 分红总额（元）。 */
+  dividendAmount: number | null;
+  /** 年度净利润（元）；中报分红等无年度净利的事件为 null。 */
+  annualNetProfit: number | null;
+  /** 年度净利润分红比例（小数，如 0.3273 = 32.73%）。 */
+  annualNetProfitDividendRatio: number | null;
+}
+
+function toDate(value: unknown): string | null {
+  const text = String(value ?? '');
+  return /^\d{4}-\d{2}-\d{2}/.test(text) ? text.slice(0, 10) : null;
+}
+
+export async function fetchDividendEvents(
   symbol: string,
   startDate: string,
   endDate: string,
   signal?: AbortSignal,
-): Promise<Array<{ date: string; dividendYield: number | null; exRightDate: string | null }>> {
+): Promise<LixingerDividendEvent[]> {
   const rows = await post<Array<Record<string, unknown>>>(
     'company/dividend',
-    {
-      token: token(),
-      stockCode: pureCode(symbol),
-      startDate,
-      endDate,
-      metricsList: ['dividendYield', 'exRightDate'],
-    },
+    { token: token(), stockCode: pureCode(symbol), startDate, endDate },
     signal,
   );
   return (rows ?? []).map((row) => ({
-    date: String(row.date ?? '').slice(0, 10),
-    dividendYield: typeof row.dividendYield === 'number' ? row.dividendYield : null,
-    exRightDate: row.exRightDate ? String(row.exRightDate) : null,
+    announceDate: toDate(row.date) ?? '',
+    fsEndDate: toDate(row.fsEndDate) ?? '',
+    currency: String(row.currency ?? 'CNY'),
+    registerDate: toDate(row.registerDate),
+    exDate: toDate(row.exDate),
+    paymentDate: toDate(row.paymentDate),
+    perShare: typeof row.dividend === 'number' ? row.dividend : 0,
+    bonusSharesFromProfit: typeof row.bonusSharesFromProfit === 'number' ? row.bonusSharesFromProfit : 0,
+    bonusSharesFromCapitalReserve:
+      typeof row.bonusSharesFromCapitalReserve === 'number' ? row.bonusSharesFromCapitalReserve : 0,
+    dividendAmount: typeof row.dividendAmount === 'number' ? row.dividendAmount : null,
+    annualNetProfit: typeof row.annualNetProfit === 'number' ? row.annualNetProfit : null,
+    annualNetProfitDividendRatio:
+      typeof row.annualNetProfitDividendRatio === 'number' ? row.annualNetProfitDividendRatio : null,
   }));
 }

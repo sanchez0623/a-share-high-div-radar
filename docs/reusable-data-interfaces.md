@@ -56,7 +56,7 @@ momentum 项目的 [lixinger_probe.py](file:///D:/Sanchez/AI/WorkbuddyProjects/a
 
 1. **P1.5-a（半天）**：✅ 已完成——东财 ulist 加 `f100` 解析行业（`industry-eastmoney.ts`，启动同步覆盖 sector，实测「保险Ⅱ/白色家电/银行Ⅱ…」）+ 腾讯 fqkline 推导交易日历（`tencent-fqkline.ts` + `trading-calendar.ts`，节假日 09:35 后判定，scheduler 每tick节流刷新）+ 腾讯行情 f39/f46 解析 PE/PB（`tencent.ts` → `RawQuote.pe/pb` → onUpdate 动态更新 `Stock.pe/pb`，实测与理杏仁口径一致）。
 2. **P1.5-b（半天）**：✅ 已完成——fqkline 除权日 bar 末位 dict 实测确认：`{"nd":"2024","fh_sh":"16.2","djr":"2025-06-27","cqr":"2025-06-30","FHcontent":"10派16.2元"}`，**免费分红路线打通**。`fetchDividendEvents`（近5年分段拉取+去重）已接入启动装配，事件落盘 `.data/dividend-events/{SYMBOL}.json`（实测平安 11 条，最新 2026-09-10 10派9.8元）。业务口径接入（receivedDividend/dividends 预测抵扣）待后续单独实施。
-3. **P2 理杏仁**：✅ 已实现为**备用源**（`providers/lixinger.ts`）——token 已配置 `.env`（LIXINGER_TOKEN，不入库），provider 串行限流 1.1s + 免费额度保护，不接主链路。实测 fundamental 接口：`{"pe_ttm":9.7733,"pb":0.9224,"dyr":0.0513}`（与腾讯口径一致）。dividend 接口实测返回空，疑似需日期范围参数，接入前再验证。**仅低频校准/人工查询使用，勿高频调用。**
+3. **P2 理杏仁**：✅ 已实现为**备用源**（`providers/lixinger.ts`）——token 已配置 `.env`（LIXINGER_TOKEN，不入库），provider 串行限流 1.1s + 免费额度保护，不接主链路。实测 fundamental 接口：`{"pe_ttm":9.7733,"pb":0.9224,"dyr":0.0513}`（与腾讯口径一致）。**dividend 接口已按官方文档调通**（`startDate` 必选、无 metricsList；实测 601318 近5年 10 条事件，含每股分红/派息率/登记·除权·到账日/送转股，字段比 fqkline 免费路线更全，`fetchDividendEvents` 已就绪）。**仅低频校准/人工查询使用，勿高频调用。**
 4. **动态添加股票基础信息**：✅ 名册接口已就绪——`providers/stock-list.ts`（上交所官方 JSON：A_STOCK_CODE/SEC_NAME_CN/LIST_DATE/CSRC_CODE_DESC，实测 2520 只，需 Referer）。深市 XLSX 未接（需 SheetJS 依赖），深市代码名称/存在性可由腾讯行情覆盖；完整「动态添加股票」功能（store+端点+UI）按 [dynamic-stock-watchlist.md](dynamic-stock-watchlist.md) 方案另行实施。
 
 ## 五、结论

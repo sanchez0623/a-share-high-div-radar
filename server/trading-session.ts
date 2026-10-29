@@ -1,12 +1,13 @@
 import type { SessionState } from '../shared/quote-types.ts';
+import { isLikelyHoliday, shanghaiDateString } from './trading-calendar.ts';
 
 const WEEKEND = new Set(['Sat', 'Sun']);
 
 /**
  * 判定 A 股交易时段（Asia/Shanghai）。
  *
- * 局限：只处理周末，不处理法定节假日——节假日会被误判为 open，
- * 上游拿不到新数据时由陈旧度兜底提示，不影响正确性；P1 接入交易所日历后再补全。
+ * 节假日：由腾讯 fqkline 指数成交日历判定（trading-calendar，09:35 后生效）；
+ * 日历未加载或窗口内保持周末判定——此时拿不到新数据由陈旧度兜底提示。
  */
 export function resolveSessionState(now: Date = new Date()): SessionState {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -23,6 +24,8 @@ export function resolveSessionState(now: Date = new Date()): SessionState {
 
   const minutes = Number(value('hour')) * 60 + Number(value('minute'));
   if (!Number.isFinite(minutes)) return 'closed';
+  // 节假日（日历推导，09:35 后可判定）。
+  if (isLikelyHoliday(minutes, shanghaiDateString(now))) return 'non-trading-day';
   // 09:15 起算 open：包含 09:15–09:25 集合竞价，此时上游已能给出盘前快照。
   if (minutes < 9 * 60 + 15) return 'pre-open';
   if (minutes < 11 * 60 + 30) return 'open';

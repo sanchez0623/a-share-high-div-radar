@@ -33,6 +33,9 @@ export interface RawQuote {
   source: QuoteSource;
   /** 该源是否返回行情时间；false 表示 quoteTime 回落为 fetchedAt（如东财批量接口）。 */
   quoteTimeReliable: boolean;
+  /** PE(TTM) 与 PB：仅腾讯快照提供（f39/f46），其他源缺省；用于动态更新 Stock 估值口径。 */
+  pe?: number | null;
+  pb?: number | null;
 }
 
 /** 供前端展示的行情快照：RawQuote + 服务端补充的时段与陈旧度。 */

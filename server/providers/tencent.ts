@@ -64,6 +64,9 @@ function parseRow(market: string, code: string, payload: string, fetchedAt: stri
     fetchedAt,
     source: 'tencent',
     quoteTimeReliable: true,
+    // 索引 39=PE(TTM)、46=PB（实测核对，见 docs/live-data-integration.md §3.2-A）。
+    pe: toNumber(fields[39]) || null,
+    pb: toNumber(fields[46]) || null,
   };
 }
 

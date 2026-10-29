@@ -1,4 +1,5 @@
 import type { QuoteService } from './quote-service.ts';
+import { ensureTradingCalendar } from './trading-calendar.ts';
 import { resolveSessionState } from './trading-session.ts';
 
 /**
@@ -17,6 +18,8 @@ export function startQuoteScheduler(
   let running = false;
   let lastSession: ReturnType<typeof resolveSessionState> | null = null;
   const timer = setInterval(() => {
+    // 节假日判定依赖的交易日历按需刷新（内部 6 小时节流，失败静默）。
+    ensureTradingCalendar();
     const session = resolveSessionState();
     const previous = lastSession;
     lastSession = session;

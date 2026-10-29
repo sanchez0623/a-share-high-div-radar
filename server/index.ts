@@ -13,6 +13,10 @@ import { eastmoneyProvider } from './providers/eastmoney.ts';
 import { sinaProvider } from './providers/sina.ts';
 import { tencentProvider } from './providers/tencent.ts';
 import { fetchDailyBarsBatch } from './providers/kline-eastmoney.ts';
+import { fetchIndustries } from './providers/industry-eastmoney.ts';
+import { fetchDividendEvents } from './providers/tencent-fqkline.ts';
+import { saveDividendEvents } from './dividend-event-store.ts';
+import { ensureTradingCalendar, refreshTradingCalendar } from './trading-calendar.ts';
 import { createQuoteService } from './quote-service.ts';
 import { startQuoteScheduler } from './quote-scheduler.ts';
 import { applyQuoteToHistory, loadAllBars, saveBars } from './bar-store.ts';
@@ -20,6 +24,13 @@ import { loadLatestQuotes, saveLatestQuotes } from './quote-store.ts';
 import { collectPortfolioSymbols } from './state-change.ts';
 import type { QuoteProvider, QuoteSource } from '../shared/quote-types.ts';
 import type { PriceBar } from '../shared/types.ts';
+
+/** 加载 .env（可选；缺失时静默跳过，例如 LIXINGER_TOKEN 等备用源凭证）。 */
+try {
+  process.loadEnvFile(fileURLToPath(new URL('../.env', import.meta.url)));
+} catch {
+  /* 没有 .env 是正常情况 */
+}
 
 const assumptionFile = fileURLToPath(new URL('./.data/assumptions.json', import.meta.url));
 const settingsFile = fileURLToPath(new URL('./.data/settings.json', import.meta.url));
@@ -39,6 +50,25 @@ function shanghaiToday(): string {
     month: '2-digit',
     day: '2-digit',
   }).format(new Date());
+}
+
+/** 行业分类真实化：东财 f100 覆盖种子 sector；个别失败保留原值。 */
+async function refreshSectors(): Promise<void> {
+  const symbols = Array.from(state.stocks.keys());
+  try {
+    const industries = await fetchIndustries(symbols);
+    let updated = 0;
+    for (const [symbol, industry] of industries) {
+      const stock = state.stocks.get(symbol);
+      if (stock && stock.sector !== industry) {
+        stock.sector = industry;
+        updated += 1;
+      }
+    }
+    console.log(`行业分类已同步（东财 f100）：${updated} 只更新`);
+  } catch (reason) {
+    console.warn(`行业分类同步失败，保留现有口径：${(reason as Error).message}`);
+  }
 }
 
 /**
@@ -117,9 +147,16 @@ const quoteService = createQuoteService(providers, {
     if (!liveActive) return;
     for (const quote of quotes) {
       const current = state.histories.get(quote.symbol);
-      if (!current) continue;
-      const next = applyQuoteToHistory(current, quote);
-      if (next !== current) state.histories.set(quote.symbol, next);
+      if (current) {
+        const next = applyQuoteToHistory(current, quote);
+        if (next !== current) state.histories.set(quote.symbol, next);
+      }
+      // PE/PB 随行情快照动态更新（腾讯 f39/f46，实测口径与理杏仁一致）；异常值不覆盖。
+      const stock = state.stocks.get(quote.symbol);
+      if (stock) {
+        if (quote.pe != null && quote.pe > 0) stock.pe = quote.pe;
+        if (quote.pb != null && quote.pb > 0) stock.pb = quote.pb;
+      }
     }
   },
   // 重启预热：上游暂时不可用时 getSnapshot 仍返回上次真实快照（陈旧度如实标注）。
@@ -162,6 +199,25 @@ if (publicDeployment && allowedOrigins.length === 0) {
 async function start(): Promise<void> {
   // 真实日线装配失败不阻断启动：自动回退演示数据（dataMode 保持 demo）。
   liveActive = await prepareLiveHistory();
+
+  if (liveActive) {
+    // 交易日历（腾讯 fqkline 指数成交日）：失败静默，回退「只判周末」并靠陈旧度兜底。
+    const calendarOk = await refreshTradingCalendar();
+    console.log(calendarOk ? '交易日历已同步（节假日判定启用）' : '交易日历同步失败，节假日暂按周末口径判定');
+    // 行业分类真实化（东财 f100）：失败保留种子口径。
+    await refreshSectors();
+    // 分红事件（腾讯 fqkline 免费路线）：落盘缓存供研究口径接入，失败不阻断。
+    try {
+      let synced = 0;
+      for (const symbol of state.stocks.keys()) {
+        saveDividendEvents(symbol, await fetchDividendEvents(symbol, 5));
+        synced += 1;
+      }
+      console.log(`分红事件已同步（近5年）：${synced} 只`);
+    } catch (reason) {
+      console.warn(`分红事件同步失败：${(reason as Error).message}`);
+    }
+  }
 
   /** 收盘固化：先刷一次终值（覆盖当日 bar），再把全部日线落盘。 */
   const persistEodBars = async () => {

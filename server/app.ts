@@ -280,10 +280,12 @@ export function createApp(
           registerStockIntoState(draft, prepared, { watchlist: true });
           return getStockSnapshot(draft, input.symbol);
         },
-        () => {
+        (draft) => {
           /** 日线先落盘：stocks.json 写失败时只是孤立缓存文件，反过来则会出现无历史的幽灵股票。 */
           saveBars(input.symbol, prepared.bars);
           upsertStockRecord(prepared.record);
+          /** 新股票默认加入观察仓：观察仓变更必须与 stocks.json 同步落盘，否则重启后丢失。 */
+          persistPortfolio(draft);
         },
       );
       res.json(stock);
@@ -353,7 +355,11 @@ export function createApp(
             };
             return { catalog: [...getCatalog(draft, true), disabledItem], record };
           },
-          (_draft, result) => upsertStockRecord(result.record),
+          (draft, result) => {
+            upsertStockRecord(result.record);
+            /** 停用会把股票移出观察仓：以 draft 落盘（此刻内存尚未提交），避免重启后观察仓残留不可用代码。 */
+            persistPortfolio(draft);
+          },
         );
         res.json(result.catalog);
         return;

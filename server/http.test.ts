@@ -25,7 +25,7 @@ import { createFileSettingsStore, type SettingsStore } from './settings-store.ts
 import { createFileRiskStore, type RiskStore } from './risk-store.ts';
 import { createFilePortfolioStore, type PortfolioStore } from './portfolio-store.ts';
 import { createDemoState } from './demo-data.ts';
-import { createMemoryStockStore } from './stock-store.ts';
+import { createMemoryStockStore, createFileStockStore } from './stock-store.ts';
 import { hydrateStocks, type StockRegistrationDeps } from './stock-registration.ts';
 import { collectPortfolioSymbols } from './state-change.ts';
 
@@ -1682,6 +1682,83 @@ test('停用与恢复：停用后从雷达隐藏且观察仓拒绝，持仓大�
   } finally {
     await new Promise<void>((resolve) => started.server.close(() => resolve()));
     cleanupTestBars(['600999.SH']);
+  }
+});
+
+test('添加与停用落盘：重启后观察仓与停用状态均保持', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dividend-stocks-'));
+  const portfolioFile = join(directory, 'portfolio.json');
+  const stocksFile = join(directory, 'stocks.json');
+  const deps = fakeStockDataDeps();
+  let first: Awaited<ReturnType<typeof startServer>> | null = null;
+  let second: Awaited<ReturnType<typeof startServer>> | null = null;
+
+  try {
+    /** 与 index.ts 的真实启动序列一致：先 hydrateStocks，再 createApp（内部恢复组合与假设）。 */
+    const launch = async () => {
+      const stockStore = createFileStockStore(stocksFile);
+      const state = createDemoState();
+      hydrateStocks(state, stockStore.load());
+      const app = createApp(state, undefined, undefined, createFilePortfolioStore(portfolioFile), {
+        stockStore,
+        stockDataDeps: deps,
+      });
+      const server = app.listen(0);
+      await new Promise<void>((resolve, reject) => {
+        server.once('listening', resolve);
+        server.once('error', reject);
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('测试服务器未监听端口');
+      return { server, baseUrl: `http://127.0.0.1:${address.port}` };
+    };
+
+    first = await launch();
+    const added = await fetch(`${first.baseUrl}/api/stocks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: '600997.SH', forecastDividend: 0.25 }),
+    });
+    assert.equal(added.status, 200);
+    await new Promise<void>((resolve, reject) => {
+      first!.server.close((error) => (error ? reject(error) : resolve()));
+    });
+    first = null;
+
+    /** 重启：观察仓必须保留自定义股票（persistPortfolio 与 stocks.json 同步落盘）。 */
+    second = await launch();
+    const dashboard = (await (
+      await fetch(`${second.baseUrl}/api/dashboard`)
+    ).json()) as DashboardResponse;
+    const restored = dashboard.stocks.find((item) => item.symbol === '600997.SH');
+    assert.ok(restored, '重启后自定义股票必须仍在雷达（观察仓持久化）');
+
+    const disabled = await fetch(`${second.baseUrl}/api/stocks/600997.SH/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    });
+    assert.equal(disabled.status, 200);
+    await new Promise<void>((resolve, reject) => {
+      second!.server.close((error) => (error ? reject(error) : resolve()));
+    });
+    second = null;
+
+    /** 再次重启：停用状态必须保持，观察仓不再包含该股票。 */
+    second = await launch();
+    const after = (await (
+      await fetch(`${second.baseUrl}/api/dashboard`)
+    ).json()) as DashboardResponse;
+    assert.ok(after.stocks.every((item) => item.symbol !== '600997.SH'), '停用后重启不得回到雷达');
+    const catalog = (await (
+      await fetch(`${second.baseUrl}/api/catalog?includeDisabled=1`)
+    ).json()) as CatalogItem[];
+    assert.equal(catalog.find((item) => item.symbol === '600997.SH')?.enabled, false);
+  } finally {
+    if (first) await new Promise<void>((resolve) => first!.server.close(() => resolve()));
+    if (second) await new Promise<void>((resolve) => second!.server.close(() => resolve()));
+    rmSync(directory, { recursive: true, force: true });
+    cleanupTestBars(['600997.SH']);
   }
 });
 

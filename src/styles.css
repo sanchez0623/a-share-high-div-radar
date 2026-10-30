@@ -633,6 +633,7 @@ table { width: 100%; border-collapse: collapse; }
 .method-get { color: #38634f; background: #e2efda; }
 .method-post { color: #53618c; background: #e7eaf4; }
 .method-patch { color: #946a39; background: #f5ead7; }
+.method-delete { color: #8c4a4a; background: #f4e0e0; }
 .api-list code { color: #365b49; font-family: var(--mono); font-size: 11px; }
 .api-list p { color: #7b8981; font-size: 10px; }
 .nonfunctional-section { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; padding: 25px 0 4px; border-top: 1px solid var(--line-dark); }

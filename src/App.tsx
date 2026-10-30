@@ -7,7 +7,6 @@ import {
   Layers3,
   LayoutDashboard,
   Menu,
-  Network,
   Radar,
   RefreshCw,
   Search,
@@ -34,9 +33,8 @@ import DividendLab from './pages/DividendLab.tsx';
 import PlanPage from './pages/PlanPage.tsx';
 import RiskPage from './pages/RiskPage.tsx';
 import PortfolioPage from './pages/PortfolioPage.tsx';
-import BlueprintPage from './pages/BlueprintPage.tsx';
 
-type View = 'dashboard' | 'detail' | 'lab' | 'plan' | 'risk' | 'portfolio' | 'blueprint';
+type View = 'dashboard' | 'detail' | 'lab' | 'plan' | 'risk' | 'portfolio';
 type ModalType = 'watchlist' | 'trade' | 'checklist' | null;
 
 const navigation = [
@@ -262,7 +260,7 @@ export default function App() {
 
   const currentNav = navigation.find((item) => item.key === view);
   const openRiskCount = data.risks.filter((risk) => risk.status !== 'verified').length;
-  const pageTitle = view === 'blueprint' ? '系统架构蓝图' : currentNav?.label ?? '息壤研究台';
+  const pageTitle = currentNav?.label ?? '息壤研究台';
   const detailLoading = <div className="inline-loading"><span className="loading-spinner" />正在计算个股研究数据…</div>;
 
   return (
@@ -281,7 +279,6 @@ export default function App() {
           })}
         </nav>
         <div className="sidebar-bottom">
-          <button className={view === 'blueprint' ? 'blueprint-link active' : 'blueprint-link'} onClick={() => navigate('blueprint')}><Network size={17} /><span>系统架构蓝图</span><span>↗</span></button>
           <div className="sidebar-principle"><LayoutDashboard size={18} /><p>不预测每一次波动，<br />只准备价格到来时的动作。</p></div>
           <div className="system-status"><span className="live-dot" /><div><strong>{data.dataMode === 'live' ? '真实行情已连接' : '演示快照已连接'}</strong><small>{data.dataMode === 'live' ? data.dataMeta.quoteTime : `数据截至 ${data.asOf}`}</small></div></div>
           <div className="version-line"><span>V0.1 · PERSONAL RESEARCH</span><span>人工决策</span></div>
@@ -311,7 +308,6 @@ export default function App() {
           {view === 'plan' && (activeDetail ? <PlanPage detail={activeDetail} stocks={data.stocks} onSelect={(symbol) => selectStock(symbol, 'plan')} preview={preview} onSavePreview={savePreview} onExitPreview={() => setPreview(null)} onCreateChecklist={() => setModal('checklist')} /> : detailLoading)}
           {view === 'risk' && <RiskPage data={data} onVerify={verifyRisk} onAddRisk={addRisk} onRefreshSource={refreshRiskSource} />}
           {view === 'portfolio' && <PortfolioPage data={data} onTrade={() => setModal('trade')} />}
-          {view === 'blueprint' && <BlueprintPage />}
         </main>
       </div>
 
